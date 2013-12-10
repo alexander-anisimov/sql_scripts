@@ -1,0 +1,21 @@
+-- Version 1
+SET NOCOUNT ON;
+IF OBJECT_ID('dbo.Nums', 'U') IS NOT NULL DROP TABLE dbo.Nums;
+
+CREATE TABLE dbo.Nums(n INT NOT NULL PRIMARY KEY);
+INSERT INTO dbo.Nums(n) VALUES(1);
+GO
+
+INSERT INTO dbo.Nums(n)
+  SELECT n + (SELECT MAX(n) FROM dbo.Nums) FROM dbo.Nums;
+GO 20
+
+-- Version 2
+SET NOCOUNT ON;
+CREATE TABLE #numbers(ID INT IDENTITY(1,1))
+GO 
+
+INSERT INTO #numbers DEFAULT VALUES;
+GO 100
+
+DROP TABLE #numbers
