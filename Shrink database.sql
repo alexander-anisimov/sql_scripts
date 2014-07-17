@@ -1,5 +1,6 @@
 -- 1 Step
-DBCC shrinkfile (tempdev,5000)
+DBCC SHRINKFILE (tempdev,5000)
+DBCC SHRINKDATABASE (tempdev,10)
 
 -- View open transactions
 DBCC opentran
