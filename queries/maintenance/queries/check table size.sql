@@ -1,6 +1,7 @@
 SELECT 
       table_name = SCHEMA_NAME(o.[schema_id]) + '.' + o.name
-    , data_size_mb = CAST(do.pages * 8. / 1024 AS DECIMAL(8,4))
+    , data_size_mb = CAST(do.pages * 8. / 1024 AS DECIMAL(10,4))
+    , total_rows
 FROM sys.objects o
 JOIN (
     SELECT
@@ -21,3 +22,8 @@ JOIN (
     GROUP BY p.[object_id]
 ) do ON o.[object_id] = do.[object_id]
 WHERE o.[type] = 'U'
+AND CAST(do.pages * 8. / 1024 AS DECIMAL(10,4)) >= 100
+--AND o.name = 'emir_log'
+--AND o.Name NOT LIKE '%Archive'
+
+order by 2 DESC

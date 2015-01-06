@@ -1,0 +1,1 @@
+http://social.technet.microsoft.com/wiki/contents/articles/21196.t-sql-random-string.aspx

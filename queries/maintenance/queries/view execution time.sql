@@ -4,7 +4,7 @@ SELECT  qs.*,'-',qp.*,'-',st.*
 FROM    sys.dm_exec_query_stats as qs
 CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) as st
-where qp.dbid = @db-- and st.text like '%select * from Crm_contacts%'
+where qp.dbid = @db and st.text like '%"ApprovedUserDocuments"%'
 
 /*
 exec sp_who;
@@ -81,7 +81,7 @@ declare
       execution_count 
       FROM sys.dm_exec_query_stats as qs
       CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) as st
-      where st.dbid = (select database_id from sys.databases where name ='CouponService_Test')
+      where st.dbid = (select database_id from sys.databases where name ='admiral')
         and st.objectid = (select object_id from sys.procedures where name = 'test') 
       ORDER BY total_worker_time DESC
 

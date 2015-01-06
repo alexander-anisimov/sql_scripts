@@ -89,20 +89,11 @@ FETCH NEXT FROM cur INTO @obj_id, @obj_name, @obj_type
 WHILE @@FETCH_STATUS = 0 BEGIN
 
     BEGIN TRY
-
-        BEGIN TRANSACTION
         EXEC sys.sp_refreshsqlmodule @name = @obj_name, @namespace = N'OBJECT' 
-        COMMIT TRANSACTION
-
     END TRY
     BEGIN CATCH
-
-        IF XACT_STATE() <> 0
-            ROLLBACK TRANSACTION
-
         INSERT INTO #objects (obj_id, obj_name, err_message, obj_type) 
         SELECT @obj_id, @obj_name, ERROR_MESSAGE(), @obj_type
-
     END CATCH
 
     FETCH NEXT FROM cur INTO @obj_id, @obj_name, @obj_type
