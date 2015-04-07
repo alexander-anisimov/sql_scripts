@@ -13,3 +13,12 @@ SELECT REVERSE(STUFF(REVERSE(@str),1,1,''))
 SELECT SUBSTRING(@str, 1, LEN(@str) - 1)
 SELECT LEFT(@str, LEN(@str) - 1)
 
+
+
+
+-- способ с подзапросом (работает начиная с 2005)
+select
+    t.TableID,
+    Details = (select convert(varchar(10),td.DetailID) + ', ' from @TableDetails td where t.TableID = td.TableID    for xml path(''))
+from
+    @Table t
