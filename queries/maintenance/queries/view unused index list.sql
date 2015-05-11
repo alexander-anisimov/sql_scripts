@@ -32,14 +32,15 @@ SELECT  OBJECT_NAME(s.object_id) AS 'TableName',
         SUM(user_lookups) AS 'User Lookups',
         SUM(user_seeks + user_scans + user_lookups) AS 'Total Reads',
         SUM(user_updates) AS 'Total Writes'
-FROM    sys.dm_db_index_usage_stats AS s
-        INNER JOIN sys.indexes AS i ON s.object_id = i.object_id
+FROM    sys.indexes AS i
+        LEFT JOIN sys.dm_db_index_usage_stats AS s ON s.object_id = i.object_id
                                        AND i.index_id = s.index_id
 WHERE   OBJECTPROPERTY(s.object_id, 'IsUserTable') = 1
         AND s.database_id = DB_ID()
-        AND OBJECT_NAME(s.object_id) = 'AccountsOperations'
+        AND OBJECT_NAME(s.object_id) = 'InsuranceCoverage'
 GROUP BY OBJECT_NAME(s.object_id),
         i.name,
         i.index_id
 ORDER BY 'Total Writes' DESC,
         'Total Reads' DESC ;
+

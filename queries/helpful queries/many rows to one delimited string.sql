@@ -1,3 +1,5 @@
+--http://blogs.msdn.com/b/amitjet/archive/2009/12/11/sql-server-comma-separated-string-to-table.aspx
+
 declare @str nvarchar(4000) = ''
 
 DECLARE @Table1 TABLE (Text NVARCHAR(100))
