@@ -1,6 +1,6 @@
 -- 15 min, without indexes
-declare @db nvarchar(max) = 'agile_pm_20150416_develop',
-        @sp nvarchar(max) = 'GenerateTransactionsByHistoryItems'
+declare @db nvarchar(max) = 'agile_pm_20150416_auth',
+        @sp nvarchar(max) = 'GetClinicDailyOverviewReportData'
 SELECT  --row_number() over (order by qs.creation_time ) as id,
         SUBSTRING(st.text, (qs.statement_start_offset/2) + 1,((CASE statement_end_offset WHEN -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS statement_text,
         total_physical_reads/execution_count as avg_total_physical_reads,
@@ -40,7 +40,7 @@ where   st.dbid = (select database_id from sys.databases where name =@db)
   AND CAST(qs.creation_time AS DATE) = CAST(CURRENT_TIMESTAMP AS DATE) 
 ) t
 
-select @sp = 'GetPatientsSearch_before'
+select @sp = 'GetClinicDailyOverviewReportData_'
 SELECT  --row_number() over (order by qs.creation_time ) as id,
         SUBSTRING(st.text, (qs.statement_start_offset/2) + 1,((CASE statement_end_offset WHEN -1 THEN DATALENGTH(st.text) ELSE qs.statement_end_offset END - qs.statement_start_offset)/2) + 1) AS statement_text,
         total_physical_reads/execution_count as avg_total_physical_reads,
