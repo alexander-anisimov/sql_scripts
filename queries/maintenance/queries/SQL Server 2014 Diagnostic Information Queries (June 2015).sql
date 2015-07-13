@@ -1,8 +1,8 @@
 
 -- SQL Server 2014 Diagnostic Information Queries
 -- Glenn Berry 
--- May 2015
--- Last Modified: May 20, 2015
+-- June 2015
+-- Last Modified: June 9, 2015
 -- http://sqlserverperformance.wordpress.com/
 -- http://sqlskills.com/blogs/glenn/
 -- Twitter: GlennAlanBerry
@@ -1134,7 +1134,7 @@ ORDER BY SUM(Rows) DESC OPTION (RECOMPILE);
 
 -- Get some key table properties (Query 63) (Table Properties)
 SELECT [name], create_date, lock_on_bulk_load, is_replicated, has_replication_filter, 
-       is_tracked_by_cdc, lock_escalation_desc, is_memory_optimized, durability_desc
+       is_tracked_by_cdc, lock_escalation_desc, is_memory_optimized, durability_desc, is_filetable
 FROM sys.tables WITH (NOLOCK) 
 ORDER BY [name] OPTION (RECOMPILE);
 
@@ -1297,14 +1297,14 @@ SELECT TOP (30) bs.machine_name, bs.server_name, bs.database_name AS [Database N
 CONVERT (BIGINT, bs.backup_size / 1048576 ) AS [Uncompressed Backup Size (MB)],
 CONVERT (BIGINT, bs.compressed_backup_size / 1048576 ) AS [Compressed Backup Size (MB)],
 CONVERT (NUMERIC (20,2), (CONVERT (FLOAT, bs.backup_size) /
-CONVERT (FLOAT, bs.compressed_backup_size))) AS [Compression Ratio], bs.has_backup_checksums,
+CONVERT (FLOAT, bs.compressed_backup_size))) AS [Compression Ratio], bs.has_backup_checksums, is_copy_only, encryptor_type,
 DATEDIFF (SECOND, bs.backup_start_date, bs.backup_finish_date) AS [Backup Elapsed Time (sec)],
 bs.backup_finish_date AS [Backup Finish Date]
 FROM msdb.dbo.backupset AS bs WITH (NOLOCK)
-WHERE DATEDIFF (SECOND, bs.backup_start_date, bs.backup_finish_date) > 0 
+WHERE database_name = DB_NAME(DB_ID())
 AND bs.backup_size > 0
 AND bs.[type] = 'D' -- Change to L if you want Log backups
-AND database_name = DB_NAME(DB_ID())
+AND DATEDIFF (SECOND, bs.backup_start_date, bs.backup_finish_date) > 0 
 ORDER BY bs.backup_finish_date DESC OPTION (RECOMPILE);
 
 -- Are your backup sizes and times changing over time?
