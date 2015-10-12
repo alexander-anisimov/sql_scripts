@@ -15,11 +15,11 @@ IF OBJECT_ID('tempdb..##sp_BlitzCache') IS NULL
   EXEC ('CREATE PROCEDURE ##sp_BlitzCache AS RETURN 0;')
 GO
 
-IF OBJECT_ID('tempdb..##sp_BlitzCache') IS NOT NULL AND OBJECT_ID('##bou_BlitzCacheProcs') IS NOT NULL
+IF OBJECT_ID('tempdb..##sp_BlitzCache') IS NOT NULL AND OBJECT_ID('tempdb..##bou_BlitzCacheProcs', 'U') IS NOT NULL
     EXEC ('DROP TABLE ##bou_BlitzCacheProcs;')
 GO
 
-IF OBJECT_ID('tempdb..##sp_BlitzCache') IS NOT NULL AND OBJECT_ID('##bou_BlitzCacheResults') IS NOT NULL
+IF OBJECT_ID('tempdb..##sp_BlitzCache') IS NOT NULL AND OBJECT_ID('tempdb..##bou_BlitzCacheResults', 'U') IS NOT NULL
     EXEC ('DROP TABLE ##bou_BlitzCacheResults;')
 GO
 
@@ -43,7 +43,7 @@ ALTER PROCEDURE ##sp_BlitzCache
     @ignore_query_hashes VARCHAR(MAX) = NULL ,
     @query_filter VARCHAR(10) = 'ALL' ,
     @reanalyze BIT = 0 ,
-    @Whole_cache BIT = 0 /* This will forcibly set @top to 2,147,483,647 */
+    @whole_cache BIT = 0 /* This will forcibly set @top to 2,147,483,647 */
 WITH RECOMPILE
 /******************************************
 sp_BlitzCache (TM) 2014, Brent Ozar Unlimited.
@@ -70,6 +70,15 @@ KNOWN ISSUES:
 - SQL Server 2008 and 2008R2 have a bug in trigger stats (see below).
 - @ignore_query_hashes and @only_query_hashes require a CSV list of hashes
   with no spaces between the hash values.
+
+v2.4.5 - 2015-04-27
+ - sp_BlitzCache will no longer fail if @reanalyze = 1 AND sp_BlitzCache has
+   never been run.
+ - sp_BlitzCache can be run from multiple SPIDs.
+ - Triggers will no longer cause sp_BlitzCache to notice itself.
+ - Fixed an int overflow when determining execution time. Now using DATEDIFF
+   on minutes of execution time instead of seconds. Queries that have used 
+   more than 28,000 days of CPU are safe!
 
 v2.4.4 - 2015-01-09
  - Fixed output to table. Sort order wasn't being obeyed and users limting
@@ -186,6 +195,8 @@ v1.1 - 2014-02-02
 AS
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+/* VERSION! */
+RAISERROR (N'Executing sp_BlitzCache v2.4.5', 0, 1) WITH NOWAIT ;
 
 DECLARE @nl nvarchar(2) = NCHAR(13) + NCHAR(10) ;
 
@@ -524,7 +535,10 @@ SET @query_filter = LOWER(@query_filter);
 IF LEFT(@query_filter, 3) NOT IN ('all', 'sta', 'pro')
   SET @query_filter = 'all';
 
-IF @reanalyze = 1
+IF @reanalyze = 1 AND OBJECT_ID('tempdb..##bou_BlitzCacheResults') IS NULL
+	SET @reanalyze = 0;
+
+IF @reanalyze = 1 
     GOTO Results
 
 
@@ -558,13 +572,14 @@ CREATE TABLE #ignore_query_hashes (
 );
 
 CREATE TABLE ##bou_BlitzCacheResults (
+	SPID INT,
     ID INT IDENTITY(1,1),
     CheckID INT,
     Priority TINYINT,
     FindingsGroup VARCHAR(50),
     Finding VARCHAR(200),
     URL VARCHAR(200),
-    Details VARCHAR(4000)
+    Details VARCHAR(4000)	
 );
 
 CREATE TABLE #p (
@@ -588,6 +603,7 @@ CREATE TABLE #configuration (
 );
 
 CREATE TABLE ##bou_BlitzCacheProcs (
+	SPID INT ,
     QueryType nvarchar(256),
     DatabaseName sysname,
     AverageCPU decimal(38,4),
@@ -796,7 +812,7 @@ OPTION (RECOMPILE);
 RAISERROR (N'Creating dynamic SQL based on SQL Server version.',0,1) WITH NOWAIT;
 
 SET @insert_list += N'
-INSERT INTO ##bou_BlitzCacheProcs (QueryType, DatabaseName, AverageCPU, TotalCPU, AverageCPUPerMinute, PercentCPUByType, PercentDurationByType,
+INSERT INTO ##bou_BlitzCacheProcs (SPID, QueryType, DatabaseName, AverageCPU, TotalCPU, AverageCPUPerMinute, PercentCPUByType, PercentDurationByType,
                     PercentReadsByType, PercentExecutionsByType, AverageDuration, TotalDuration, AverageReads, TotalReads, ExecutionCount,
                     ExecutionsPerMinute, TotalWrites, AverageWrites, PercentWritesByType, WritesPerMinute, PlanCreationTime,
                     LastExecutionTime, StatementStartOffset, StatementEndOffset, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows,
@@ -806,11 +822,11 @@ INSERT INTO ##bou_BlitzCacheProcs (QueryType, DatabaseName, AverageCPU, TotalCPU
 
 SET @body += N'
 FROM   (SELECT *,
-               CAST((CASE WHEN DATEDIFF(second, cached_time, GETDATE()) > 0 AND execution_count > 1
-                          THEN DATEDIFF(second, cached_time, GETDATE()) / 60.0
+               CAST((CASE WHEN DATEDIFF(mi, cached_time, GETDATE()) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, GETDATE()) 
                           ELSE NULL END) as MONEY) as age_minutes,
-               CAST((CASE WHEN DATEDIFF(second, cached_time, last_execution_time) > 0 AND execution_count > 1
-                          THEN DATEDIFF(second, cached_time, last_execution_time) / 60.0
+               CAST((CASE WHEN DATEDIFF(mi, cached_time, last_execution_time) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, last_execution_time) 
                           ELSE Null END) as MONEY) as age_minutes_lifetime
         FROM   sys.#view# x ' + @nl ;
 
@@ -839,6 +855,7 @@ IF @duration_filter IS NOT NULL
 
 SET @plans_triggers_select_list += N'
 SELECT TOP (@top)
+       @@SPID ,
        ''Procedure: '' + COALESCE(OBJECT_NAME(qs.object_id, qs.database_id),'''') AS QueryType,
        COALESCE(DB_NAME(database_id), CAST(pa.value AS sysname), ''-- N/A --'') AS DatabaseName,
        (total_worker_time / 1000.0) / execution_count AS AvgCPU ,
@@ -912,6 +929,7 @@ BEGIN
     
     SET @sql += N'
     SELECT TOP (@top)
+           @@SPID ,
            ''Statement'' AS QueryType,
            COALESCE(DB_NAME(CAST(pa.value AS INT)), ''-- N/A --'') AS DatabaseName,
            (total_worker_time / 1000.0) / execution_count AS AvgCPU ,
@@ -1061,6 +1079,8 @@ BEGIN
 
    IF @ignore_system_db = 1
       SET @sql += ' AND COALESCE(DB_NAME(database_id), CAST(pa.value AS sysname), '''') NOT IN (''master'', ''model'', ''msdb'', ''tempdb'', ''32767'') ' + @nl ;
+   
+   SET @sql += @body_order + @nl + @nl + @nl ;
 END
 
 
@@ -1703,8 +1723,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE frequent_execution =1)
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (1,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    1,
                     100,
                     'Execution Pattern',
                     'Frequently Executed Queries',
@@ -1717,8 +1738,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  parameter_sniffing = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (2,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    2,
                     50,
                     'Parameterization',
                     'Parameter Sniffing',
@@ -1730,8 +1752,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_forced_plan = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (3,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    3,
                     5,
                     'Parameterization',
                     'Forced Plans',
@@ -1743,8 +1766,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_cursor = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (4,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    4,
                     200,
                     'Cursors',
                     'Cursors',
@@ -1755,8 +1779,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_forced_parameterized = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (5,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    5,
                     50,
                     'Parameterization',
                     'Forced Parameterization',
@@ -1767,8 +1792,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  p.is_parallel = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (6,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    6,
                     200,
                     'Execution Plans',
                     'Parallelism',
@@ -1779,8 +1805,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  near_parallel = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (7,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    7,
                     200,
                     'Execution Plans',
                     'Nearly Parallel',
@@ -1791,8 +1818,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  plan_warnings = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (8,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    8,
                     50,
                     'Execution Plans',
                     'Query Plan Warnings',
@@ -1803,8 +1831,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  long_running = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (9,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    9,
                     50,
                     'Performance',
                     'Long Running Queries',
@@ -1816,8 +1845,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  p.missing_index_count > 0)
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (10,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    10,
                     50,
                     'Performance',
                     'Missing Index Request',
@@ -1828,8 +1858,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  p.downlevel_estimator = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (13,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    13,
                     200,
                     'Cardinality',
                     'Legacy Cardinality Estimator in Use',
@@ -1840,8 +1871,9 @@ BEGIN
                    FROM ##bou_BlitzCacheProcs p
                    WHERE implicit_conversions = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (14,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    14,
                     50,
                     'Performance',
                     'Implicit Conversions',
@@ -1852,8 +1884,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  tempdb_spill = 1
                   )
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (15,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                15,
                 10,
                 'Performance',
                 'TempDB Spills',
@@ -1863,8 +1896,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  busy_loops = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (16,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                16,
                 10,
                 'Performance',
                 'Frequently executed operators',
@@ -1874,8 +1908,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  tvf_join = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (17,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                17,
                 50,
                 'Performance',
                 'Joining to table valued functions',
@@ -1885,8 +1920,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  compile_timeout = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (18,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                18,
                 50,
                 'Execution Plans',
                 'Compilation timeout',
@@ -1896,8 +1932,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  compile_memory_limit_exceeded = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (19,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                19,
                 50,
                 'Execution Plans',
                 'Compilation memory limit exceeded',
@@ -1907,8 +1944,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  warning_no_join_predicate = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (20,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                20,
                 10,
                 'Execution Plans',
                 'No join predicate',
@@ -1918,8 +1956,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  plan_multiple_plans = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (21,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                21,
                 200,
                 'Execution Plans',
                 'Multiple execution plans',
@@ -1929,8 +1968,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  unmatched_index_count > 0)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (22,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                22,
                 100,
                 'Performance',
                 'Unmatched indexes',
@@ -1940,8 +1980,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  unparameterized_query = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (23,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                23,
                 100,
                 'Parameterization',
                 'Unparameterized queries',
@@ -1951,8 +1992,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_trivial = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (24,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                24,
                 100,
                 'Execution Plans',
                 'Trivial Plans',
@@ -1970,6 +2012,7 @@ BEGIN
             Details,
             CheckID
     FROM    ##bou_BlitzCacheResults
+    WHERE   SPID = @@SPID
     GROUP BY Priority,
             FindingsGroup,
             Finding,
@@ -2111,7 +2154,7 @@ END
 SET @sql = N'
 SELECT  TOP (@top) ' + @columns + @nl + N'
 FROM    ##bou_BlitzCacheProcs
-WHERE   1 = 1 ' + @nl
+WHERE   SPID = @spid ' + @nl
 
 SELECT @sql += N' ORDER BY ' + CASE @sort_order WHEN 'cpu' THEN ' TotalCPU '
                                                 WHEN 'reads' THEN ' TotalReads '
@@ -2126,10 +2169,14 @@ SELECT @sql += N' ORDER BY ' + CASE @sort_order WHEN 'cpu' THEN ' TotalCPU '
                                END + N' DESC '
 SET @sql += N' OPTION (RECOMPILE) ; '
 
-EXEC sp_executesql @sql, N'@top INT', @top ;
+EXEC sp_executesql @sql, N'@top INT, @spid INT', @top, @@SPID ;
 
 
 GO
+
+
+
+
 
 
 
@@ -3824,12 +3871,14 @@ GO
 
 
 
+
+
 IF OBJECT_ID('tempdb..##sp_AskBrent') IS NULL
   EXEC ('CREATE PROCEDURE ##sp_AskBrent AS RETURN 0;')
 GO
 
 
-ALTER PROCEDURE [##sp_AskBrent]
+ALTER PROCEDURE [dbo].[##sp_AskBrent]
     @Question NVARCHAR(MAX) = NULL ,
     @AsOf DATETIME = NULL ,
     @ExpertMode TINYINT = 0 ,
@@ -3881,10 +3930,32 @@ Known limitations of this version:
 Unknown limitations of this version:
  - None. Like Zombo.com, the only limit is yourself.
 
+Changes in v16 - July 18, 2015
+ - Azure SQL Database compatibility.
+ - Temporarily removing CheckID 5, Query Problems - Long-Running Query Blocking
+   Others. This one is typically the slowest check on heavily active systems,
+   and it doesn't work in Azure, and I'm lazy.
+
+Changes in v15 - June 10, 2015
+ - If @Seconds = 0, return results since the time the server restarted. Only
+   useful for @ExpertMode = 1 for now, though - I'm filtering out most of the
+   "live" checks near the end. I'll enable those back in over time I fix them.
+ - Added Server Info output of priority 250 for Compiles and Recompiles per
+   Second when @ExpertMode = 1. (Checks 25 and 26)
+ - Fixed a bug where many checks weren't working for named instances.
+
+Changes in v14 - Mar 1, 2015
+ - Added CPU utilization >50% check, plus informational log (checks 23 and 24).
+ - In main result set, wait stats are now sorted by seconds descending, not
+   alphabetically.
+ - "No Problems Found" is now priority 1 instead of 255 since I want it to
+   show up above the informational server-info checks.
+ - Bug fixes and improvements.
+
 Changes in v13 - Feb 22, 2015
  - Added Server Info output of priority 251 for Total Database Size and Total
    Databases (checks 21 and 22).
- - Added parameters @OutputTableNameFileStats, @OutputTableNamePerfmon, and
+ - Added parameters @OutputTableNameFileStats, @OutputTableNamePerfmonStats,
    @OutputTableNameWaitStats to persist these work tables to disk if you want
    to examine performance over time. I'd strongly recommend that you buy a
    real monitoring program, though. I'm only storing the second pass of each
@@ -3974,7 +4045,7 @@ Changes in v1 - July 11, 2013
 */
 
 
-SELECT @Version = 13, @VersionDate = '20150222'
+SELECT @Version = 16, @VersionDate = '20150718'
 
 DECLARE @StringToExecute NVARCHAR(4000),
 	@ParmDefinitions NVARCHAR(4000),
@@ -4000,8 +4071,15 @@ SELECT
 	@LineFeed = CHAR(13) + CHAR(10),
 	@StartSampleTime = GETDATE(),
 	@FinishSampleTime = DATEADD(ss, @Seconds, GETDATE()),
-	@OurSessionID = @@SPID,
-	@ServiceName = CASE WHEN @@SERVICENAME = 'MSSQLSERVER' THEN 'SQLServer' ELSE 'MSSQL$' + @@SERVICENAME END;
+	@OurSessionID = @@SPID
+
+
+IF @Seconds = 0
+	SELECT @StartSampleTime = create_date , @FinishSampleTime = GETDATE()
+		FROM sys.databases 
+		WHERE database_id = 2;
+ELSE
+	SELECT @StartSampleTime = GETDATE(), @FinishSampleTime = DATEADD(ss, @Seconds, GETDATE());
 
 IF @OutputType = 'SCHEMA'
 BEGIN
@@ -4155,6 +4233,16 @@ BEGIN
 		DROP TABLE #FilterPlansByDatabase;
 	CREATE TABLE #FilterPlansByDatabase (DatabaseID INT PRIMARY KEY CLUSTERED);
 
+	IF OBJECT_ID('tempdb..#MasterFiles') IS NOT NULL 
+		DROP TABLE #MasterFiles;
+	CREATE TABLE #MasterFiles (database_id INT, file_id INT, type_desc NVARCHAR(50), name NVARCHAR(50), physical_name NVARCHAR(255), size BIGINT);
+	/* Azure SQL Database doesn't have sys.master_files, so we have to build our own. */
+	IF CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
+		SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT DB_ID(), file_id, type_desc, name, physical_name, size FROM sys.database_files;'
+	ELSE
+		SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT database_id, file_id, type_desc, name, physical_name, size FROM sys.master_files;'
+	EXEC(@StringToExecute);
+
 	IF @FilterPlansByDatabase IS NOT NULL
 		BEGIN
 		IF UPPER(LEFT(@FilterPlansByDatabase,4)) = 'USER'
@@ -4193,6 +4281,18 @@ BEGIN
 	SELECT @StockWarningFooter = @LineFeed + @LineFeed + '-- ?>',
 		@StockDetailsHeader = '<?ClickToSeeDetails -- ' + @LineFeed,
 		@StockDetailsFooter = @LineFeed + ' -- ?>';
+
+	/* Get the instance name to use as a Perfmon counter prefix. */
+	IF CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
+		SELECT TOP 1 @ServiceName = LEFT(object_name, (CHARINDEX(':', object_name) - 1))
+		FROM sys.dm_os_performance_counters;
+	ELSE
+		BEGIN
+		SET @StringToExecute = 'INSERT INTO #PerfmonStats(object_name, Pass, SampleTime, counter_name, cntr_type) SELECT CASE WHEN @@SERVICENAME = ''MSSQLSERVER'' THEN ''SQLServer'' ELSE ''MSSQL$'' + @@SERVICENAME END, 0, GETDATE(), ''stuffing'', 0 ;'
+		EXEC(@StringToExecute);
+		SELECT @ServiceName = object_name FROM #PerfmonStats;
+		DELETE #PerfmonStats;
+		END
 
 	/* Build a list of queries that were run in the last 10 seconds.
 	   We're looking for the death-by-a-thousand-small-cuts scenario
@@ -4341,11 +4441,11 @@ BEGIN
 	INSERT #WaitStats(Pass, SampleTime, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count)
 	SELECT
 		1 AS Pass,
-		GETDATE() AS SampleTime,
+		CASE @Seconds WHEN 0 THEN @StartSampleTime ELSE GETDATE() END AS SampleTime,
 		os.wait_type,
-		SUM(os.wait_time_ms) OVER (PARTITION BY os.wait_type) as sum_wait_time_ms,
-		SUM(os.signal_wait_time_ms) OVER (PARTITION BY os.wait_type ) as sum_signal_wait_time_ms,
-		SUM(os.waiting_tasks_count) OVER (PARTITION BY os.wait_type) AS sum_waiting_tasks
+		CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.wait_time_ms) OVER (PARTITION BY os.wait_type) END as sum_wait_time_ms,
+		CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.signal_wait_time_ms) OVER (PARTITION BY os.wait_type ) END as sum_signal_wait_time_ms,
+		CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.waiting_tasks_count) OVER (PARTITION BY os.wait_type) END AS sum_waiting_tasks
 	FROM sys.dm_os_wait_stats os
 	WHERE os.wait_type not in (
 		'REQUEST_FOR_DEADLOCK_SEARCH',
@@ -4383,7 +4483,8 @@ BEGIN
 		'HADR_TIMER_TASK',
 		'HADR_WORK_QUEUE',
 		'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
-		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP'
+		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+		'RESOURCE_GOVERNOR_IDLE'
 	)
 	ORDER BY sum_wait_time_ms DESC;
 
@@ -4392,42 +4493,43 @@ BEGIN
 		num_of_reads, [bytes_read] , io_stall_write_ms,num_of_writes, [bytes_written], PhysicalName, TypeDesc)
 	SELECT 
 		1 AS Pass,
-		GETDATE() AS SampleTime,
+		CASE @Seconds WHEN 0 THEN @StartSampleTime ELSE GETDATE() END AS SampleTime,
 		mf.[database_id],
 		mf.[file_id],
 		DB_NAME(vfs.database_id) AS [db_name], 
 		mf.name + N' [' + mf.type_desc COLLATE SQL_Latin1_General_CP1_CI_AS + N']' AS file_logical_name ,
 		CAST(( ( vfs.size_on_disk_bytes / 1024.0 ) / 1024.0 ) AS INT) AS size_on_disk_mb ,
-		vfs.io_stall_read_ms ,
-		vfs.num_of_reads ,
-		vfs.[num_of_bytes_read],
-		vfs.io_stall_write_ms ,
-		vfs.num_of_writes ,
-		vfs.[num_of_bytes_written],
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.io_stall_read_ms END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.num_of_reads END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.[num_of_bytes_read] END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.io_stall_write_ms END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.num_of_writes END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.[num_of_bytes_written] END ,
 		mf.physical_name,
 		mf.type_desc
 	FROM sys.dm_io_virtual_file_stats (NULL, NULL) AS vfs
-	INNER JOIN sys.master_files AS mf ON vfs.file_id = mf.file_id
+	INNER JOIN #MasterFiles AS mf ON vfs.file_id = mf.file_id
 		AND vfs.database_id = mf.database_id
 	WHERE vfs.num_of_reads > 0
 		OR vfs.num_of_writes > 0;
 
 	INSERT INTO #PerfmonStats (Pass, SampleTime, [object_name],[counter_name],[instance_name],[cntr_value],[cntr_type])
 	SELECT 		1 AS Pass,
-		GETDATE() AS SampleTime, RTRIM(dmv.object_name), RTRIM(dmv.counter_name), RTRIM(dmv.instance_name), dmv.cntr_value, dmv.cntr_type
+		CASE @Seconds WHEN 0 THEN @StartSampleTime ELSE GETDATE() END AS SampleTime, RTRIM(dmv.object_name), RTRIM(dmv.counter_name), RTRIM(dmv.instance_name), CASE @Seconds WHEN 0 THEN 0 ELSE dmv.cntr_value END, dmv.cntr_type
 		FROM #PerfmonCounters counters
-		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name = RTRIM(dmv.counter_name)
-			AND counters.[object_name] = RTRIM(dmv.[object_name])
-			AND (counters.[instance_name] IS NULL OR counters.[instance_name] = RTRIM(dmv.[instance_name]))
+		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.counter_name) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND counters.[object_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[object_name]) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND (counters.[instance_name] IS NULL OR counters.[instance_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[instance_name]) COLLATE SQL_Latin1_General_CP1_CI_AS)
 
 	/* Maintenance Tasks Running - Backup Running - CheckID 1 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 1 AS CheckID,
 		1 AS Priority,
 		'Maintenance Tasks Running' AS FindingGroup,
 		'Backup Running' AS Finding,
 		'http://BrentOzar.com/askbrent/backups/' AS URL,
-		'Backup of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM sys.master_files WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
+		'Backup of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
 		'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
 		pl.query_plan AS QueryPlan,
 		r.start_time AS StartTime,
@@ -4453,21 +4555,22 @@ BEGIN
 
 
 	/* If there's a backup running, add details explaining how long full backup has been taking in the last month. */
-	UPDATE #AskBrentResults
-	SET Details = Details + ' Over the last 60 days, the full backup usually takes ' + CAST((SELECT AVG(DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date)) FROM msdb.dbo.backupset bs WHERE abr.DatabaseName = bs.database_name AND bs.type = 'D' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL) AS NVARCHAR(100)) + ' minutes.'
-	FROM #AskBrentResults abr
-	WHERE abr.CheckID = 1 AND EXISTS (SELECT * FROM msdb.dbo.backupset bs WHERE bs.type = 'D' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL AND abr.DatabaseName = bs.database_name AND DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date) > 1)
-
+	IF @Seconds > 0 AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) <> 'SQL Azure'
+	BEGIN
+		SET @StringToExecute = 'UPDATE #AskBrentResults SET Details = Details + '' Over the last 60 days, the full backup usually takes '' + CAST((SELECT AVG(DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date)) FROM msdb.dbo.backupset bs WHERE abr.DatabaseName = bs.database_name AND bs.type = ''D'' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL) AS NVARCHAR(100)) + '' minutes.'' FROM #AskBrentResults abr WHERE abr.CheckID = 1 AND EXISTS (SELECT * FROM msdb.dbo.backupset bs WHERE bs.type = ''D'' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL AND abr.DatabaseName = bs.database_name AND DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date) > 1)';
+		EXEC(@StringToExecute);
+	END
 
 
 	/* Maintenance Tasks Running - DBCC Running - CheckID 2 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 2 AS CheckID,
 		1 AS Priority,
 		'Maintenance Tasks Running' AS FindingGroup,
 		'DBCC Running' AS Finding,
 		'http://BrentOzar.com/askbrent/dbcc/' AS URL,
-		'Corruption check of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM sys.master_files WHERE database_id = db.resource_database_id) + 'GB) has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
+		'Corruption check of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
 		'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
 		pl.query_plan AS QueryPlan,
 		r.start_time AS StartTime,
@@ -4493,13 +4596,14 @@ BEGIN
 
 
 	/* Maintenance Tasks Running - Restore Running - CheckID 3 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 3 AS CheckID,
 		1 AS Priority,
 		'Maintenance Tasks Running' AS FindingGroup,
 		'Restore Running' AS Finding,
 		'http://BrentOzar.com/askbrent/backups/' AS URL,
-		'Restore of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM sys.master_files WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
+		'Restore of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
 		'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
 		pl.query_plan AS QueryPlan,
 		r.start_time AS StartTime,
@@ -4525,6 +4629,7 @@ BEGIN
 
 
 	/* SQL Server Internal Maintenance - Database File Growing - CheckID 4 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 4 AS CheckID,
 		1 AS Priority,
@@ -4551,6 +4656,8 @@ BEGIN
 
 
 	/* Query Problems - Long-Running Query Blocking Others - CheckID 5 */
+	/*
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 5 AS CheckID,
 		1 AS Priority,
@@ -4586,6 +4693,7 @@ BEGIN
 	LEFT OUTER JOIN sys.dm_exec_requests rBlocker ON tBlocked.blocking_session_id = rBlocker.session_id
 	  WHERE NOT EXISTS (SELECT * FROM sys.dm_os_waiting_tasks tBlocker WHERE tBlocker.session_id = tBlocked.blocking_session_id AND tBlocker.blocking_session_id IS NOT NULL)
 	  AND s.last_request_start_time < DATEADD(SECOND, -30, GETDATE())
+	*/
 
 	/* Query Problems - Plan Cache Erased Recently */
 	IF DATEADD(mi, -15, GETDATE()) < (SELECT TOP 1 creation_time FROM sys.dm_exec_query_stats ORDER BY creation_time)
@@ -4608,6 +4716,7 @@ BEGIN
 
 
 	/* Query Problems - Sleeping Query with Open Transactions - CheckID 8 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText, OpenTransactionCount)
 	SELECT 8 AS CheckID,
 		50 AS Priority,
@@ -4642,6 +4751,7 @@ BEGIN
 
 
 	/* Query Problems - Query Rolling Back - CheckID 9 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText)
 	SELECT 9 AS CheckID,
 		1 AS Priority,
@@ -4696,7 +4806,7 @@ BEGIN
 		CAST(CAST(SUM (size)*8./1024./1024. AS BIGINT) AS VARCHAR(100)) AS Details,
         SUM (size)*8./1024./1024. AS DetailsInt,
         'http://www.BrentOzar.com/askbrent/' AS URL
-	FROM sys.master_files
+	FROM #MasterFiles
 	WHERE database_id > 4
 
 	/* Server Info - Database Count - CheckID 22 */
@@ -4710,6 +4820,43 @@ BEGIN
         'http://www.BrentOzar.com/askbrent/' AS URL
 	FROM sys.databases
 	WHERE database_id > 4
+
+    /* Server Performance - High CPU Utilization CheckID 24 */
+    IF @Seconds < 30
+        BEGIN
+        /* If we're waiting less than 30 seconds, run this check now rather than wait til the end.
+           We get this data from the ring buffers, and it's only updated once per minute, so might
+           as well get it now - whereas if we're checking 30+ seconds, it might get updated by the
+           end of our sp_AskBrent session. */
+        INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
+        SELECT 24, 50, 'Server Performance', 'High CPU Utilization', CAST(100 - SystemIdle AS NVARCHAR(20)) + N'%. Ring buffer details: ' + CAST(record AS NVARCHAR(4000)), 100 - SystemIdle, 'http://BrentOzar.com/go/cpu'
+            FROM ( 
+                SELECT record,
+                    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') as SystemIdle
+                FROM ( 
+                    SELECT TOP 1 CONVERT(XML, record) as record 
+                    FROM sys.dm_os_ring_buffers 
+                    WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                    AND record LIKE '%<SystemHealth>%'
+                    ORDER BY timestamp DESC) AS rb 
+            ) as y 
+            WHERE 100 - SystemIdle >= 50
+
+        INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
+        SELECT 23, 250, 'Server Info', 'CPU Utilization', CAST(100 - SystemIdle AS NVARCHAR(20)) + N'%. Ring buffer details: ' + CAST(record AS NVARCHAR(4000)), 100 - SystemIdle, 'http://BrentOzar.com/go/cpu'
+            FROM ( 
+                SELECT record,
+                    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') as SystemIdle
+                FROM ( 
+                    SELECT TOP 1 CONVERT(XML, record) as record 
+                    FROM sys.dm_os_ring_buffers 
+                    WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                    AND record LIKE '%<SystemHealth>%'
+                    ORDER BY timestamp DESC) AS rb 
+            ) as y 
+
+        END /* IF @Seconds < 30 */
+
 
 	/* End of checks. If we haven't waited @Seconds seconds, wait. */
 	IF GETDATE() < @FinishSampleTime
@@ -4762,7 +4909,8 @@ BEGIN
 		'HADR_TIMER_TASK',
 		'HADR_WORK_QUEUE',
 		'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
-		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP'
+		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+		'RESOURCE_GOVERNOR_IDLE'
 	)
 	ORDER BY sum_wait_time_ms DESC;
 
@@ -4786,7 +4934,7 @@ BEGIN
 		0,
 		0
 	FROM sys.dm_io_virtual_file_stats (NULL, NULL) AS vfs
-	INNER JOIN sys.master_files AS mf ON vfs.file_id = mf.file_id
+	INNER JOIN #MasterFiles AS mf ON vfs.file_id = mf.file_id
 		AND vfs.database_id = mf.database_id
 	WHERE vfs.num_of_reads > 0
 		OR vfs.num_of_writes > 0;
@@ -4796,9 +4944,9 @@ BEGIN
 		GETDATE() AS SampleTime,
 		RTRIM(dmv.object_name), RTRIM(dmv.counter_name), RTRIM(dmv.instance_name), dmv.cntr_value, dmv.cntr_type
 		FROM #PerfmonCounters counters
-		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name = RTRIM(dmv.counter_name)
-			AND counters.[object_name] = RTRIM(dmv.[object_name])
-			AND (counters.[instance_name] IS NULL OR counters.[instance_name] = RTRIM(dmv.[instance_name]))
+		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.counter_name) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND counters.[object_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[object_name]) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND (counters.[instance_name] IS NULL OR counters.[instance_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[instance_name]) COLLATE SQL_Latin1_General_CP1_CI_AS)
 
 	/* Set the latencies and averages. We could do this with a CTE, but we're not ambitious today. */
 	UPDATE fNow
@@ -4818,7 +4966,8 @@ BEGIN
 			[value_per_second] = ((1.0 * pNow.cntr_value - pFirst.cntr_value) / DATEDIFF(ss, pFirst.SampleTime, pNow.SampleTime)) 
 		FROM #PerfmonStats pNow
 			INNER JOIN #PerfmonStats pFirst ON pFirst.[object_name] = pNow.[object_name] AND pFirst.counter_name = pNow.counter_name AND (pFirst.instance_name = pNow.instance_name OR (pFirst.instance_name IS NULL AND pNow.instance_name IS NULL))
-				AND pNow.ID > pFirst.ID;
+				AND pNow.ID > pFirst.ID
+		WHERE  DATEDIFF(ss, pFirst.SampleTime, pNow.SampleTime) > 0;
 
 
 	/* If we're within 10 seconds of our projected finish time, do the plan cache analysis. */
@@ -4970,17 +5119,18 @@ BEGIN
 
 	/* Wait Stats - CheckID 6 */
 	/* Compare the current wait stats to the sample we took at the start, and insert the top 10 waits. */
-	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt)
+	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, DetailsInt)
 	SELECT TOP 10 6 AS CheckID,
 		200 AS Priority,
 		'Wait Stats' AS FindingGroup,
 		wNow.wait_type AS Finding,
 		N'http://www.brentozar.com/sql/wait-stats/#' + wNow.wait_type AS URL,
-		'For ' + CAST(((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS NVARCHAR(100)) + ' seconds over the last ' + CAST(@Seconds AS NVARCHAR(10)) + ' seconds, SQL Server was waiting on this particular bottleneck.' + @LineFeed + @LineFeed AS Details,
-		'See the URL for more details on how to mitigate this wait type.' AS HowToStopIt
+		'For ' + CAST(((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS NVARCHAR(100)) + ' seconds over the last ' + CASE @Seconds WHEN 0 THEN (CAST(DATEDIFF(dd,@StartSampleTime,@FinishSampleTime) AS NVARCHAR(10)) + ' days') ELSE (CAST(@Seconds AS NVARCHAR(10)) + ' seconds') END + ', SQL Server was waiting on this particular bottleneck.' + @LineFeed + @LineFeed AS Details,
+		'See the URL for more details on how to mitigate this wait type.' AS HowToStopIt,
+        ((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS DetailsInt
 	FROM #WaitStats wNow
 	LEFT OUTER JOIN #WaitStats wBase ON wNow.wait_type = wBase.wait_type AND wNow.SampleTime > wBase.SampleTime
-	WHERE wNow.wait_time_ms > (wBase.wait_time_ms + (.5 * @Seconds * 1000)) /* Only look for things we've actually waited on for half of the time or more */
+	WHERE wNow.wait_time_ms > (wBase.wait_time_ms + (.5 * (DATEDIFF(ss,@StartSampleTime,@FinishSampleTime)) * 1000)) /* Only look for things we've actually waited on for half of the time or more */
 	ORDER BY (wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) DESC;
 
 	/* Server Performance - Slow Data File Reads - CheckID 11 */
@@ -5038,7 +5188,7 @@ BEGIN
 		'Pre-grow data and log files during maintenance windows so that they do not grow during production loads. See the URL for more details.'  AS HowToStopIt
 	FROM #PerfmonStats ps
 	WHERE ps.Pass = 2
-		AND object_name = 'SQLServer:Databases'
+		AND object_name = @ServiceName + ':Databases'
 		AND counter_name = 'Log Growths'
 		AND value_delta > 0
 
@@ -5055,7 +5205,7 @@ BEGIN
 		'Pre-grow data and log files during maintenance windows so that they do not grow during production loads. See the URL for more details.' AS HowToStopIt
 	FROM #PerfmonStats ps
 	WHERE ps.Pass = 2
-		AND object_name = 'SQLServer:Databases'
+		AND object_name = @ServiceName + ':Databases'
 		AND counter_name = 'Log Shrinks'
 		AND value_delta > 0
 
@@ -5071,9 +5221,9 @@ BEGIN
 			+ 'For OLTP environments, Microsoft recommends that 90% of batch requests should hit the plan cache, and not be compiled from scratch. We are exceeding that threshold.' + @LineFeed AS Details,
 		'Find out why plans are not being reused, and consider enabling Forced Parameterization. See the URL for more details.' AS HowToStopIt
 	FROM #PerfmonStats ps
-		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = 'SQLServer:SQL Statistics' AND psComp.counter_name = 'SQL Compilations/sec' AND psComp.value_delta > 0
+		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = @ServiceName + ':SQL Statistics' AND psComp.counter_name = 'SQL Compilations/sec' AND psComp.value_delta > 0
 	WHERE ps.Pass = 2
-		AND ps.object_name = 'SQLServer:SQL Statistics'
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
 		AND ps.counter_name = 'Batch Requests/sec'
 		AND ps.value_delta > (1000 * @Seconds) /* Ignore servers sitting idle */
 		AND (psComp.value_delta * 10) > ps.value_delta /* Compilations are more than 10% of batch requests per second */
@@ -5090,9 +5240,9 @@ BEGIN
 			+ 'More than 10% of our queries are being recompiled. This is typically due to statistics changing on objects.' + @LineFeed AS Details,
 		'Find out which objects are changing so quickly that they hit the stats update threshold. See the URL for more details.' AS HowToStopIt
 	FROM #PerfmonStats ps
-		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = 'SQLServer:SQL Statistics' AND psComp.counter_name = 'SQL Re-Compilations/sec' AND psComp.value_delta > 0
+		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = @ServiceName + ':SQL Statistics' AND psComp.counter_name = 'SQL Re-Compilations/sec' AND psComp.value_delta > 0
 	WHERE ps.Pass = 2
-		AND ps.object_name = 'SQLServer:SQL Statistics'
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
 		AND ps.counter_name = 'Batch Requests/sec'
 		AND ps.value_delta > (1000 * @Seconds) /* Ignore servers sitting idle */
 		AND (psComp.value_delta * 10) > ps.value_delta /* Recompilations are more than 10% of batch requests per second */
@@ -5109,26 +5259,100 @@ BEGIN
 	FROM #PerfmonStats ps
         INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
 	WHERE ps.Pass = 2
-		AND ps.object_name = 'SQLServer:SQL Statistics'
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
 		AND ps.counter_name = 'Batch Requests/sec';
 
-	/* Server Info - Wait Time per Core per Sec - CheckID 19 */
-    WITH waits1(waits_ms) AS (SELECT SUM(ws1.wait_time_ms) FROM #WaitStats ws1 WHERE ws1.Pass = 1),
-    waits2(waits_ms) AS (SELECT SUM(ws2.wait_time_ms) FROM #WaitStats ws2 WHERE ws2.Pass = 2)
+
+		INSERT INTO #PerfmonCounters ([object_name],[counter_name],[instance_name]) VALUES (@ServiceName + ':SQL Statistics','SQL Compilations/sec', NULL)
+		INSERT INTO #PerfmonCounters ([object_name],[counter_name],[instance_name]) VALUES (@ServiceName + ':SQL Statistics','SQL Re-Compilations/sec', NULL)
+
+	/* Server Info - SQL Compilations/sec - CheckID 25 */
+    IF @ExpertMode = 1
+	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
+	SELECT 25 AS CheckID,
+		250 AS Priority,
+		'Server Info' AS FindingGroup,
+		'SQL Compilations per Sec' AS Finding,
+		'http://BrentOzar.com/go/measure' AS URL,
+		CAST(ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS NVARCHAR(20)) AS Details,
+        ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS DetailsInt
+	FROM #PerfmonStats ps
+        INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
+	WHERE ps.Pass = 2
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
+		AND ps.counter_name = 'SQL Compilations/sec';
+
+	/* Server Info - SQL Re-Compilations/sec - CheckID 26 */
+    IF @ExpertMode = 1
+	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
+	SELECT 26 AS CheckID,
+		250 AS Priority,
+		'Server Info' AS FindingGroup,
+		'SQL Re-Compilations per Sec' AS Finding,
+		'http://BrentOzar.com/go/measure' AS URL,
+		CAST(ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS NVARCHAR(20)) AS Details,
+        ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS DetailsInt
+	FROM #PerfmonStats ps
+        INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
+	WHERE ps.Pass = 2
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
+		AND ps.counter_name = 'SQL Re-Compilations/sec';
+
+	/* Server Info - Wait Time per Core per Sec - CheckID 20 */
+    WITH waits1(SampleTime, waits_ms) AS (SELECT SampleTime, SUM(ws1.wait_time_ms) FROM #WaitStats ws1 WHERE ws1.Pass = 1 GROUP BY SampleTime),
+    waits2(SampleTime, waits_ms) AS (SELECT SampleTime, SUM(ws2.wait_time_ms) FROM #WaitStats ws2 WHERE ws2.Pass = 2 GROUP BY SampleTime),
+	cores(cpu_count) AS (SELECT SUM(1) FROM sys.dm_os_schedulers WHERE status = 'VISIBLE ONLINE' AND is_online = 1)
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
 	SELECT 19 AS CheckID,
 		250 AS Priority,
 		'Server Info' AS FindingGroup,
 		'Wait Time per Core per Sec' AS Finding,
-		'http://BrentOzar.com/sql/wait-stats/' AS URL,
-		CAST((waits2.waits_ms - waits1.waits_ms) / i.cpu_count / 1000 AS NVARCHAR(20)) AS Details,
-        (waits2.waits_ms - waits1.waits_ms) / i.cpu_count /1000 AS DetailsInt
-	FROM sys.dm_os_sys_info i
+		'http://BrentOzar.com/go/measure' AS URL,
+		CAST((waits2.waits_ms - waits1.waits_ms) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS NVARCHAR(20)) AS Details,
+        (waits2.waits_ms - waits1.waits_ms) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS DetailsInt
+	FROM cores i
       CROSS JOIN waits1
       CROSS JOIN waits2;
 
+    /* Server Performance - High CPU Utilization CheckID 24 */
+    IF @Seconds >= 30
+        BEGIN
+        /* If we're waiting 30+ seconds, run this check at the end.
+           We get this data from the ring buffers, and it's only updated once per minute, so might
+           as well get it now - whereas if we're checking 30+ seconds, it might get updated by the
+           end of our sp_AskBrent session. */
+        INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
+        SELECT 24, 50, 'Server Performance', 'High CPU Utilization', CAST(100 - SystemIdle AS NVARCHAR(20)) + N'%. Ring buffer details: ' + CAST(record AS NVARCHAR(4000)), 100 - SystemIdle, 'http://BrentOzar.com/go/cpu'
+            FROM ( 
+                SELECT record,
+                    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') as SystemIdle
+                FROM ( 
+                    SELECT TOP 1 CONVERT(XML, record) as record 
+                    FROM sys.dm_os_ring_buffers 
+                    WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                    AND record LIKE '%<SystemHealth>%'
+                    ORDER BY timestamp DESC) AS rb 
+            ) as y 
+            WHERE 100 - SystemIdle >= 50
+
+        INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, Details, DetailsInt, URL)
+        SELECT 23, 250, 'Server Info', 'CPU Utilization', CAST(100 - SystemIdle AS NVARCHAR(20)) + N'%. Ring buffer details: ' + CAST(record AS NVARCHAR(4000)), 100 - SystemIdle, 'http://BrentOzar.com/go/cpu'
+            FROM ( 
+                SELECT record,
+                    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') as SystemIdle
+                FROM ( 
+                    SELECT TOP 1 CONVERT(XML, record) as record 
+                    FROM sys.dm_os_ring_buffers 
+                    WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' 
+                    AND record LIKE '%<SystemHealth>%'
+                    ORDER BY timestamp DESC) AS rb 
+            ) as y 
+
+        END /* IF @Seconds < 30 */
+
+
 	/* If we didn't find anything, apologize. */
-	IF NOT EXISTS (SELECT * FROM #AskBrentResults WHERE CheckID NOT IN (19, 20))
+	IF NOT EXISTS (SELECT * FROM #AskBrentResults WHERE Priority < 250)
 	BEGIN
 
 		INSERT  INTO #AskBrentResults
@@ -5140,7 +5364,7 @@ BEGIN
 				  Details
 				)
 		VALUES  ( -1 ,
-				  255 ,
+				  1 ,
 				  'No Problems Found' ,
 				  'From Brent Ozar Unlimited' ,
 				  'http://www.BrentOzar.com/askbrent/' ,
@@ -5148,8 +5372,6 @@ BEGIN
 				);
 		
 	END /*IF NOT EXISTS (SELECT * FROM #AskBrentResults) */
-	ELSE /* We found stuff, so add credits */
-	BEGIN
 
 		/* Add credits for the nice folks who put so much time into building and maintaining this for free: */                    
 		INSERT  INTO #AskBrentResults
@@ -5185,7 +5407,6 @@ BEGIN
 				  'Thanks from the Brent Ozar Unlimited team.  We hope you found this tool useful, and if you need help relieving your SQL Server pains, email us at Help@BrentOzar.com.'
 				);
 
-	END /* ELSE  We found stuff, so add credits */
 
 	/* @OutputTableName lets us export the results to a permanent table */
 	IF @OutputDatabaseName IS NOT NULL
@@ -5599,7 +5820,11 @@ BEGIN
                 LEFT OUTER JOIN #QueryStats qsFirst ON r.QueryStatsFirstID = qsFirst.ID
 			ORDER BY r.Priority ,
 					r.FindingsGroup ,
-					r.Finding ,
+					CASE
+                        WHEN r.CheckID = 6 THEN DetailsInt
+                        ELSE 0
+                    END DESC,
+                    r.Finding,
 					r.ID;
 		END
 		ELSE IF @OutputType IN ( 'CSV', 'RSV' ) 
@@ -5616,7 +5841,11 @@ BEGIN
 			FROM    #AskBrentResults
 			ORDER BY Priority ,
 					FindingsGroup ,
-					Finding ,
+					CASE
+                        WHEN CheckID = 6 THEN DetailsInt
+                        ELSE 0
+                    END DESC,
+                    Finding,
 					Details;
 		END
 		ELSE IF @ExpertMode = 0 AND @OutputXMLasNVARCHAR = 0
@@ -5630,9 +5859,14 @@ BEGIN
 					[QueryText],
 					[QueryPlan]
 			FROM    #AskBrentResults
+			WHERE (@Seconds > 0 OR (Priority IN (0, 250, 251, 255))) /* For @Seconds = 0, filter out broken checks for now */
 			ORDER BY Priority ,
 					FindingsGroup ,
-					Finding ,
+					CASE
+                        WHEN CheckID = 6 THEN DetailsInt
+                        ELSE 0
+                    END DESC,
+                    Finding,
 					ID;
 		END
 		ELSE IF @ExpertMode = 0 AND @OutputXMLasNVARCHAR = 1
@@ -5646,9 +5880,14 @@ BEGIN
 					CAST([QueryText] AS NVARCHAR(MAX)) AS QueryText,
 					CAST([QueryPlan] AS NVARCHAR(MAX)) AS QueryPlan
 			FROM    #AskBrentResults
+			WHERE (@Seconds > 0 OR (Priority IN (0, 250, 251, 255))) /* For @Seconds = 0, filter out broken checks for now */
 			ORDER BY Priority ,
 					FindingsGroup ,
-					Finding ,
+					CASE
+                        WHEN CheckID = 6 THEN DetailsInt
+                        ELSE 0
+                    END DESC,
+                    Finding,
 					ID;
 		END
 		ELSE IF @ExpertMode = 1
@@ -5698,9 +5937,14 @@ BEGIN
 				LEFT OUTER JOIN #QueryStats qsTotalFirst ON qsTotalFirst.Pass = -1
 				LEFT OUTER JOIN #QueryStats qsNow ON r.QueryStatsNowID = qsNow.ID
                 LEFT OUTER JOIN #QueryStats qsFirst ON r.QueryStatsFirstID = qsFirst.ID
+			WHERE (@Seconds > 0 OR (Priority IN (0, 250, 251, 255))) /* For @Seconds = 0, filter out broken checks for now */
 			ORDER BY r.Priority ,
 					r.FindingsGroup ,
-					r.Finding ,
+					CASE
+                        WHEN r.CheckID = 6 THEN DetailsInt
+                        ELSE 0
+                    END DESC,
+                    r.Finding,
 					r.ID;
 
 			-------------------------
@@ -5863,6 +6107,19 @@ SET NOCOUNT OFF;
 GO
 
 
+/* How to run it:
+EXEC dbo.sp_AskBrent 
+
+With extra diagnostic info:
+EXEC dbo.sp_AskBrent @ExpertMode = 1;
+
+In Ask a Question mode:
+EXEC dbo.sp_AskBrent 'Is this cursor bad?';
+*/
+
+
+
+
 
 
 
@@ -5898,13 +6155,13 @@ ALTER PROCEDURE [##sp_Blitz]
 AS
     SET NOCOUNT ON;
 	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
-	SELECT @Version = 39, @VersionDate = '20150216'
+	SELECT @Version = 40, @VersionDate = '20150427'
 
 	IF @Help = 1 PRINT '
 	/*
-	sp_Blitz (TM) v39 - February 16, 2015
+	sp_Blitz (TM) v40 - April 27, 2015
 
-	(C) 2014, Brent Ozar Unlimited.
+	(C) 2015, Brent Ozar Unlimited.
 	See http://BrentOzar.com/go/eula for the End User Licensing Agreement.
 
 	To learn more, visit http://www.BrentOzar.com/blitz where you can download
@@ -5925,6 +6182,24 @@ AS
 	Unknown limitations of this version:
 	 - None.  (If we knew them, they would be known. Duh.)
 
+  	Changes in v40 - April 27, 2015
+	 - Added check 158 for 1MB growth sizes on databases over 10GB. Probably time
+       to up that growth size. Contributed by Henrik Staun Poulsen.
+     - Added check 159 for queries with more than 50 execution plans in cache,
+       an indicator that it is not parameterized properly.
+     - Fixed check 97 that said Data Center Edition was subject to CPU and
+       memory limits, which is not true. It is only subject to wallet limits.
+       Reported by Brad Nelson.
+     - Fixed checks 106, 150, 151 to be skipped when the default trace file has
+       disappeared. Coded by Steve Coles.
+     - Fixed check 1, the VERY FIRST CHECK IN THE SCRIPT, which had a bug when
+       catching databases that had never been backed up. Sure, there was a
+       workaround in the next statement, but Julie Citro spotted the bug and
+       made it right. First check, people. All of you who ever read this code,
+       Julie Citro is officially a better code reviewer than you.
+  	 - Skip backup checks on offline databases.
+  	 - For order and join hints, raised threshold to 1000 instead of 1.
+	 
   	Changes in v39 - February 16, 2015
 	 - Added @OutputType option for NONE if you only want to log the results to
 	    a table. (For Jefferson Elias.)
@@ -6221,8 +6496,8 @@ AS
 			)
 
         /* Used for the default trace checks. */
-        DECLARE @path NVARCHAR(256);
-        SELECT @path=CAST(value as NVARCHAR(256))
+        DECLARE @TracePath NVARCHAR(256);
+        SELECT @TracePath=CAST(value as NVARCHAR(256))
             FROM sys.fn_trace_getinfo(1)
             WHERE traceid=1 AND property=2;
         
@@ -6300,14 +6575,13 @@ AS
 										'Backups Not Performed Recently' AS Finding ,
 										'http://BrentOzar.com/go/nobak' AS URL ,
 										'Database ' + d.Name + ' last backed up: '
-										+ CAST(COALESCE(MAX(b.backup_finish_date),
-														' never ') AS VARCHAR(200)) AS Details
+										+ COALESCE(CAST(MAX(b.backup_finish_date) AS VARCHAR(25)),'never') AS Details
 								FROM    master.sys.databases d
 										LEFT OUTER JOIN msdb.dbo.backupset b ON d.name COLLATE SQL_Latin1_General_CP1_CI_AS = b.database_name COLLATE SQL_Latin1_General_CP1_CI_AS
 																  AND b.type = 'D'
 																  AND b.server_name = SERVERPROPERTY('ServerName') /*Backupset ran on current server */
 								WHERE   d.database_id <> 2  /* Bonus points if you know what that means */
-										AND d.state <> 1 /* Not currently restoring, like log shipping databases */
+										AND d.state NOT IN(1, 6, 10) /* Not currently offline or restoring, like log shipping databases */
 										AND d.is_in_standby = 0 /* Not a log shipping target database */
 										AND d.source_database_id IS NULL /* Excludes database snapshots */
 										AND d.name NOT IN ( SELECT DISTINCT
@@ -6319,50 +6593,15 @@ AS
 										*/
 								GROUP BY d.name
 								HAVING  MAX(b.backup_finish_date) <= DATEADD(dd,
-																  -7, GETDATE());
+																  -7, GETDATE())
+                                        OR MAX(b.backup_finish_date) IS NULL;
 						/*
 						And there you have it. The rest of this stored procedure works the same
 						way: it asks:
 						- Should I skip this check?
 						- If not, do I find problems?
 						- Insert the results into #BlitzResults
-						This particular check is just a little bit fancy - it also has a second
-						query below that checks for databases that have NEVER been backed up.
-						We use CheckID #1 for both of these just because they represent the same
-						problem - a database that needs a backup.
 						*/
-
-						INSERT  INTO #BlitzResults
-								( CheckID ,
-								  DatabaseName ,
-								  Priority ,
-								  FindingsGroup ,
-								  Finding ,
-								  URL ,
-								  Details
-								)
-								SELECT  1 AS CheckID ,
-										d.name AS DatabaseName ,
-										1 AS Priority ,
-										'Backup' AS FindingsGroup ,
-										'Backups Not Performed Recently' AS Finding ,
-										'http://BrentOzar.com/go/nobak' AS URL ,
-										( 'Database ' + d.Name
-										  + ' never backed up.' ) AS Details
-								FROM    master.sys.databases d
-								WHERE   d.database_id <> 2 /* Bonus points if you know what that means */
-										AND d.state <> 1 /* Not currently restoring, like log shipping databases */
-										AND d.is_in_standby = 0 /* Not a log shipping target database */
-										AND d.source_database_id IS NULL /* Excludes database snapshots */
-										AND d.name NOT IN ( SELECT DISTINCT
-																  DatabaseName
-															FROM  #SkipChecks
-															WHERE CheckID IS NULL )
-										AND NOT EXISTS ( SELECT *
-														 FROM   msdb.dbo.backupset b
-														 WHERE  d.name COLLATE SQL_Latin1_General_CP1_CI_AS = b.database_name COLLATE SQL_Latin1_General_CP1_CI_AS
-																AND b.type = 'D'
-																AND b.server_name = SERVERPROPERTY('ServerName') /*Backupset ran on current server */)
 
 					END
 
@@ -7885,7 +8124,7 @@ AS
 										+ ' instances of order hinting have been recorded since restart.  This means queries are bossing the SQL Server optimizer around, and if they don''t know what they''re doing, this can cause more harm than good.  This can also explain why DBA tuning efforts aren''t working.' AS Details
 								FROM    sys.dm_exec_query_optimizer_info
 								WHERE   counter = 'order hint'
-										AND occurrence > 1
+										AND occurrence > 1000
 					END
 
 				IF NOT EXISTS ( SELECT  1
@@ -7909,7 +8148,7 @@ AS
 										+ ' instances of join hinting have been recorded since restart.  This means queries are bossing the SQL Server optimizer around, and if they don''t know what they''re doing, this can cause more harm than good.  This can also explain why DBA tuning efforts aren''t working.' AS Details
 								FROM    sys.dm_exec_query_optimizer_info
 								WHERE   counter = 'join hint'
-										AND occurrence > 1
+										AND occurrence > 1000
 					END
 
 				IF NOT EXISTS ( SELECT  1
@@ -8085,6 +8324,31 @@ AS
 		WHERE   is_percent_growth = 1 ';
 					END
 
+                /* addition by Henrik Staun Poulsen, Stovi Software */
+				IF NOT EXISTS ( SELECT  1
+								FROM    #SkipChecks
+								WHERE   DatabaseName IS NULL AND CheckID = 158 )
+					BEGIN
+						EXEC sp_MSforeachdb 'use [?];
+		INSERT INTO #BlitzResults
+		(CheckID,
+		DatabaseName,
+		Priority,
+		FindingsGroup,
+		Finding,
+		URL, Details)
+		SELECT  DISTINCT 158 AS CheckID,
+		''?'' as DatabaseName,
+		100 AS Priority,
+		''Performance'' AS FindingsGroup,
+		''File growth set to 1MB'',
+		''http://brentozar.com/go/percentgrowth'' AS URL,
+		''The ['' + DB_NAME() + ''] database is using 1MB filegrowth settings, but it has grown larger than 10GB. Time to up the growth amount.''
+		FROM    [?].sys.database_files
+        WHERE is_percent_growth = 0 and growth=128 and size > 1280000 ';
+					END
+
+
 				IF NOT EXISTS ( SELECT  1
 								FROM    #SkipChecks
 								WHERE   DatabaseName IS NULL AND CheckID = 97 )
@@ -8107,6 +8371,7 @@ AS
 										  + ', which is capped at low amounts of CPU and memory.' ) AS Details
 								WHERE   CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) NOT LIKE '%Standard%'
 										AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) NOT LIKE '%Enterprise%'
+										AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) NOT LIKE '%Data Center%'
 										AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) NOT LIKE '%Developer%'
 										AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) NOT LIKE '%Business Intelligence%'
 					END
@@ -8788,6 +9053,7 @@ AS
                         IF NOT EXISTS ( SELECT  1
 				                        FROM    #SkipChecks
 				                        WHERE   DatabaseName IS NULL AND CheckID = 150 )
+                            AND @TracePath IS NOT NULL
 	                        BEGIN
 
 		                        INSERT  INTO #BlitzResults
@@ -8806,7 +9072,7 @@ AS
 						                        'Errors Logged Recently in the Default Trace' AS Finding ,
 						                        'http://BrentOzar.com/go/defaulttrace' AS URL ,
 						                         CAST(t.TextData AS NVARCHAR(4000)) AS Details
-                                        FROM    sys.fn_trace_gettable(@path, DEFAULT) t
+                                        FROM    sys.fn_trace_gettable(@TracePath, DEFAULT) t
                                         WHERE t.EventClass = 22
                                           AND t.Severity >= 17
                                           AND t.StartTime > DATEADD(dd, -30, GETDATE())
@@ -8817,6 +9083,7 @@ AS
                         IF NOT EXISTS ( SELECT  1
 				                        FROM    #SkipChecks
 				                        WHERE   DatabaseName IS NULL AND CheckID = 151 )
+                            AND @TracePath IS NOT NULL
 	                        BEGIN
 		                        INSERT  INTO #BlitzResults
 				                        ( CheckID ,
@@ -8834,12 +9101,34 @@ AS
 						                        'Log File Growths Slow' AS Finding ,
 						                        'http://BrentOzar.com/go/filegrowth' AS URL ,
 						                        CAST(COUNT(*) AS NVARCHAR(100)) + ' growths took more than 15 seconds each. Consider setting log file autogrowth to a smaller increment.' AS Details
-                                        FROM    sys.fn_trace_gettable(@path, DEFAULT) t
+                                        FROM    sys.fn_trace_gettable(@TracePath, DEFAULT) t
                                         WHERE t.EventClass = 93
                                           AND t.StartTime > DATEADD(dd, -30, GETDATE())
-                                          AND t.Duration > 1 --15000000
+                                          AND t.Duration > 15000000
                                         GROUP BY t.DatabaseName
                                         HAVING COUNT(*) > 1
+	                        END
+
+
+                        /* Performance - Many Plans for One Query */
+                        IF NOT EXISTS ( SELECT  1
+				                        FROM    #SkipChecks
+				                        WHERE   DatabaseName IS NULL AND CheckID = 160 )
+                            AND EXISTS (SELECT * FROM sys.all_columns WHERE name = 'query_hash')
+	                        BEGIN
+		                        SET @StringToExecute = 'INSERT INTO #BlitzResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
+			                        SELECT TOP 1 160 AS CheckID,
+			                        100 AS Priority,
+			                        ''Performance'' AS FindingsGroup,
+			                        ''Many Plans for One Query'' AS Finding,
+			                        ''http://BrentOzar.com/go/parameterization'' AS URL,
+			                        ''More than 50 plans are present for a single query in the plan cache - meaning we probably have parameterization issues.'' AS Details
+			                        FROM sys.dm_exec_query_stats qs
+                                    CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) pa
+                                    WHERE pa.attribute = ''dbid''
+                                    GROUP BY qs.query_hash, pa.value
+                                    HAVING COUNT(DISTINCT plan_handle) > 50';
+		                        EXECUTE(@StringToExecute);
 	                        END
 
 
@@ -9001,6 +9290,30 @@ AS
 		  LEFT OUTER JOIN [?].sys.dm_db_index_usage_stats ius ON i.object_id = ius.object_id AND i.index_id = ius.index_id AND ius.database_id = sd.database_id
 		  WHERE i.type_desc = ''HEAP'' AND COALESCE(ius.user_seeks, ius.user_scans, ius.user_lookups, ius.user_updates) IS NOT NULL
 		  AND sd.name <> ''tempdb'' AND o.is_ms_shipped = 0 AND o.type <> ''S''';
+							END
+
+						IF NOT EXISTS ( SELECT  1
+										FROM    #SkipChecks
+										WHERE   DatabaseName IS NULL AND CheckID = 159 )
+                            AND EXISTS(SELECT * FROM sys.all_objects WHERE name = 'fn_validate_plan_guide')
+							BEGIN
+								EXEC dbo.sp_MSforeachdb 'USE [?];
+			INSERT INTO #BlitzResults
+			(CheckID,
+			DatabaseName,
+			Priority,
+			FindingsGroup,
+			Finding,
+			URL,
+			Details)
+		  SELECT DISTINCT 159,
+		  ''?'',
+		  20,
+		  ''Reliability'',
+		  ''Plan Guides Failing'',
+		  ''http://BrentOzar.com/go/misguided'',
+		  (''The ['' + DB_NAME() + ''] database has plan guides that are no longer valid, so the queries involved may be failing silently.'')
+		  FROM [?].sys.plan_guides g CROSS APPLY fn_validate_plan_guide(g.plan_guide_id)';
 							END
 
 						IF NOT EXISTS ( SELECT  1
@@ -9461,6 +9774,7 @@ AS
 						IF @@VERSION LIKE '%Microsoft SQL Server 2008%'
 							OR @@VERSION LIKE '%Microsoft SQL Server 2012%'
 							OR @@VERSION LIKE '%Microsoft SQL Server 2014%'
+							OR @@VERSION LIKE '%Microsoft SQL Server v.Next%'
 							BEGIN
 								IF @CheckProcedureCacheFilter = 'CPU'
 									OR @CheckProcedureCacheFilter IS NULL
@@ -9794,7 +10108,8 @@ AS
 								FROM    #SkipChecks
 								WHERE   DatabaseName IS NULL AND CheckID = 69 )
 					BEGIN
-						IF @@VERSION LIKE 'Microsoft SQL Server 2012%' OR @@VERSION LIKE 'Microsoft SQL Server 2014%'
+						IF @@VERSION LIKE 'Microsoft SQL Server 2012%' OR @@VERSION LIKE 'Microsoft SQL Server 2014%' OR @@VERSION LIKE '%Microsoft SQL Server v.Next%'
+
 							BEGIN
 								EXEC sp_MSforeachdb N'USE [?];
 		  INSERT INTO #LogInfo2012
@@ -10386,6 +10701,7 @@ AS
 											FROM    #SkipChecks
 											WHERE   DatabaseName IS NULL AND CheckID = 106 )
 											AND (select convert(int,value_in_use) from sys.configurations where name = 'default trace enabled' ) = 1
+                                AND DATALENGTH( COALESCE( @base_tracefilename, '' ) ) > DATALENGTH('.TRC')
 							BEGIN
 
 								INSERT  INTO #BlitzResults

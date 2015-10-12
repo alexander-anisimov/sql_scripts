@@ -5,11 +5,11 @@ IF OBJECT_ID('dbo.sp_BlitzCache') IS NULL
   EXEC ('CREATE PROCEDURE dbo.sp_BlitzCache AS RETURN 0;')
 GO
 
-IF OBJECT_ID('dbo.sp_BlitzCache') IS NOT NULL AND OBJECT_ID('##bou_BlitzCacheProcs') IS NOT NULL
+IF OBJECT_ID('dbo.sp_BlitzCache') IS NOT NULL AND OBJECT_ID('tempdb.dbo.##bou_BlitzCacheProcs', 'U') IS NOT NULL
     EXEC ('DROP TABLE ##bou_BlitzCacheProcs;')
 GO
 
-IF OBJECT_ID('dbo.sp_BlitzCache') IS NOT NULL AND OBJECT_ID('##bou_BlitzCacheResults') IS NOT NULL
+IF OBJECT_ID('dbo.sp_BlitzCache') IS NOT NULL AND OBJECT_ID('tempdb.dbo.##bou_BlitzCacheResults', 'U') IS NOT NULL
     EXEC ('DROP TABLE ##bou_BlitzCacheResults;')
 GO
 
@@ -31,9 +31,11 @@ ALTER PROCEDURE dbo.sp_BlitzCache
     @ignore_system_db BIT = 1 ,
     @only_query_hashes VARCHAR(MAX) = NULL ,
     @ignore_query_hashes VARCHAR(MAX) = NULL ,
+    @sql_handle VARCHAR(MAX) = NULL ,
     @query_filter VARCHAR(10) = 'ALL' ,
+    @database_name NVARCHAR(128) = NULL ,
     @reanalyze BIT = 0 ,
-    @Whole_cache BIT = 0 /* This will forcibly set @top to 2,147,483,647 */
+    @whole_cache BIT = 0 /* This will forcibly set @top to 2,147,483,647 */
 WITH RECOMPILE
 /******************************************
 sp_BlitzCache (TM) 2014, Brent Ozar Unlimited.
@@ -60,6 +62,28 @@ KNOWN ISSUES:
 - SQL Server 2008 and 2008R2 have a bug in trigger stats (see below).
 - @ignore_query_hashes and @only_query_hashes require a CSV list of hashes
   with no spaces between the hash values.
+
+v2.4.6 - 2015-06-18
+ - temporary object cleanup will actually occur - thanks to Bob Klimes for
+   spotting this
+ - adding memory grants to expert mode and export to excel mode
+ - parent object name is now displayed next to statements that come from a
+   stored procedure
+ - run clean up in ##bou_BlitzCacheProcs before executing - this should 
+   prevent duplicate records from building up over multiple executions on 
+   the same SPID.
+ - added a @sql_handle parameter to filter on queries from a specific 
+   sql_handle or sql_handles
+ - added support for filtering on database name
+
+v2.4.5 - 2015-04-27
+ - sp_BlitzCache will no longer fail if @reanalyze = 1 AND sp_BlitzCache has
+   never been run.
+ - sp_BlitzCache can be run from multiple SPIDs.
+ - Triggers will no longer cause sp_BlitzCache to notice itself.
+ - Fixed an int overflow when determining execution time. Now using DATEDIFF
+   on minutes of execution time instead of seconds. Queries that have used 
+   more than 28,000 days of CPU are safe!
 
 v2.4.4 - 2015-01-09
  - Fixed output to table. Sort order wasn't being obeyed and users limting
@@ -176,6 +200,8 @@ v1.1 - 2014-02-02
 AS
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+/* VERSION! */
+RAISERROR (N'Executing sp_BlitzCache v2.4.6', 0, 1) WITH NOWAIT ;
 
 DECLARE @nl nvarchar(2) = NCHAR(13) + NCHAR(10) ;
 
@@ -249,7 +275,17 @@ BEGIN
     SELECT N'@ignore_query_hashes',
            N'VARCHAR(MAX)',
            N'A list of query hashes to ignore.'
-           
+    
+    UNION ALL
+    SELECT N'@sql_handle',
+           N'VARCHAR(MAX)',
+           N'One or more sql_handles to use for filtering results.'
+
+    UNION ALL
+    SELECT N'@database_name',
+           N'NVARCHAR(128)',
+           N'A database name which is used for filtering results.'
+
     UNION ALL
     SELECT N'@whole_cache',
            N'BIT',
@@ -485,6 +521,110 @@ BEGIN
     RETURN
 END
 
+IF OBJECT_ID('tempdb.dbo.##bou_BlitzCacheResults') IS NULL
+BEGIN
+    CREATE TABLE ##bou_BlitzCacheResults (
+        SPID INT,
+        ID INT IDENTITY(1,1),
+        CheckID INT,
+        Priority TINYINT,
+        FindingsGroup VARCHAR(50),
+        Finding VARCHAR(200),
+        URL VARCHAR(200),
+        Details VARCHAR(4000) 
+    );
+END
+
+IF OBJECT_ID('tempdb.dbo.##bou_BlitzCacheProcs') IS NULL
+BEGIN
+    CREATE TABLE ##bou_BlitzCacheProcs (
+        SPID INT ,
+        QueryType nvarchar(256),
+        DatabaseName sysname,
+        AverageCPU decimal(38,4),
+        AverageCPUPerMinute decimal(38,4),
+        TotalCPU decimal(38,4),
+        PercentCPUByType money,
+        PercentCPU money,
+        AverageDuration decimal(38,4),
+        TotalDuration decimal(38,4),
+        PercentDuration money,
+        PercentDurationByType money,
+        AverageReads bigint,
+        TotalReads bigint,
+        PercentReads money,
+        PercentReadsByType money,
+        ExecutionCount bigint,
+        PercentExecutions money,
+        PercentExecutionsByType money,
+        ExecutionsPerMinute money,
+        TotalWrites bigint,
+        AverageWrites money,
+        PercentWrites money,
+        PercentWritesByType money,
+        WritesPerMinute money,
+        PlanCreationTime datetime,
+        LastExecutionTime datetime,
+        PlanHandle varbinary(64),
+        SqlHandle varbinary(64),
+        QueryHash binary(8),
+        QueryPlanHash binary(8),
+        StatementStartOffset int,
+        StatementEndOffset int,
+        MinReturnedRows bigint,
+        MaxReturnedRows bigint,
+        AverageReturnedRows money,
+        TotalReturnedRows bigint,
+        LastReturnedRows bigint,
+        QueryText nvarchar(max),
+        QueryPlan xml,
+        /* these next four columns are the total for the type of query.
+            don't actually use them for anything apart from math by type.
+            */
+        TotalWorkerTimeForType bigint,
+        TotalElapsedTimeForType bigint,
+        TotalReadsForType bigint,
+        TotalExecutionCountForType bigint,
+        TotalWritesForType bigint,
+        NumberOfPlans int,
+        NumberOfDistinctPlans int,
+        SerialDesiredMemory float,
+        SerialRequiredMemory float,
+        min_worker_time bigint,
+        max_worker_time bigint,
+        is_forced_plan bit,
+        is_forced_parameterized bit,
+        is_cursor bit,
+        is_parallel bit,
+        frequent_execution bit,
+        parameter_sniffing bit,
+        unparameterized_query bit,
+        near_parallel bit,
+        plan_warnings bit,
+        plan_multiple_plans bit,
+        long_running bit,
+        downlevel_estimator bit,
+        implicit_conversions bit,
+        tempdb_spill bit,
+        busy_loops bit,
+        tvf_join bit,
+        tvf_estimate bit,
+        compile_timeout bit,
+        compile_memory_limit_exceeded bit,
+        warning_no_join_predicate bit,
+        QueryPlanCost float,
+        missing_index_count int,
+        unmatched_index_count int,
+        min_elapsed_time bigint,
+        max_elapsed_time bigint,
+        age_minutes money,
+        age_minutes_lifetime money,
+        is_trivial bit,
+        SetOptions VARCHAR(MAX),
+        Warnings VARCHAR(MAX)
+    );
+END
+
 DECLARE @duration_filter_i INT,
         @msg NVARCHAR(4000) ;
 
@@ -514,24 +654,26 @@ SET @query_filter = LOWER(@query_filter);
 IF LEFT(@query_filter, 3) NOT IN ('all', 'sta', 'pro')
   SET @query_filter = 'all';
 
-IF @reanalyze = 1
+IF @reanalyze = 1 AND OBJECT_ID('tempdb..##bou_BlitzCacheResults') IS NULL
+    SET @reanalyze = 0;
+
+IF @reanalyze = 1 
     GOTO Results
 
+DELETE FROM ##bou_BlitzCacheProcs
+WHERE  SPID = @@SPID ;
 
 IF OBJECT_ID('tempdb..#only_query_hashes') IS NOT NULL
     DROP TABLE #only_query_hashes ;
 
 IF OBJECT_ID('tempdb..#ignore_query_hashes') IS NOT NULL
     DROP TABLE #ignore_query_hashes ;
-   
-IF OBJECT_ID('tempdb..##bou_BlitzCacheResults') IS NOT NULL
-    DROP TABLE ##bou_BlitzCacheResults;
 
+IF OBJECT_ID('tempdb..#only_sql_handles') IS NOT NULL
+    DROP TABLE #only_sql_handles ;
+   
 IF OBJECT_ID('tempdb..#p') IS NOT NULL
     DROP TABLE #p;
-
-IF OBJECT_ID('tempdb..##bou_BlitzCacheProcs') IS NOT NULL
-    DROP TABLE ##bou_BlitzCacheProcs;
 
 IF OBJECT_ID ('tempdb..#checkversion') IS NOT NULL
     DROP TABLE #checkversion;
@@ -547,14 +689,8 @@ CREATE TABLE #ignore_query_hashes (
     query_hash BINARY(8)
 );
 
-CREATE TABLE ##bou_BlitzCacheResults (
-    ID INT IDENTITY(1,1),
-    CheckID INT,
-    Priority TINYINT,
-    FindingsGroup VARCHAR(50),
-    Finding VARCHAR(200),
-    URL VARCHAR(200),
-    Details VARCHAR(4000)
+CREATE TABLE #only_sql_handles (
+    sql_handle VARBINARY(64)
 );
 
 CREATE TABLE #p (
@@ -568,8 +704,11 @@ CREATE TABLE #p (
 
 CREATE TABLE #checkversion (
     version nvarchar(128),
-    maj_version AS SUBSTRING(version, 1,CHARINDEX('.', version) + 1 ),
-    build AS PARSENAME(CONVERT(varchar(32), version), 2)
+    common_version AS SUBSTRING(version, 1, CHARINDEX('.', version) + 1 ),
+    major AS PARSENAME(CONVERT(VARCHAR(32), version), 4),
+    minor AS PARSENAME(CONVERT(VARCHAR(32), version), 3),
+    build AS PARSENAME(CONVERT(varchar(32), version), 2),
+    revision AS PARSENAME(CONVERT(VARCHAR(32), version), 1)
 );
 
 CREATE TABLE #configuration (
@@ -577,92 +716,46 @@ CREATE TABLE #configuration (
     value DECIMAL(38,0)
 );
 
-CREATE TABLE ##bou_BlitzCacheProcs (
-    QueryType nvarchar(256),
-    DatabaseName sysname,
-    AverageCPU decimal(38,4),
-    AverageCPUPerMinute decimal(38,4),
-    TotalCPU decimal(38,4),
-    PercentCPUByType money,
-    PercentCPU money,
-    AverageDuration decimal(38,4),
-    TotalDuration decimal(38,4),
-    PercentDuration money,
-    PercentDurationByType money,
-    AverageReads bigint,
-    TotalReads bigint,
-    PercentReads money,
-    PercentReadsByType money,
-    ExecutionCount bigint,
-    PercentExecutions money,
-    PercentExecutionsByType money,
-    ExecutionsPerMinute money,
-    TotalWrites bigint,
-    AverageWrites money,
-    PercentWrites money,
-    PercentWritesByType money,
-    WritesPerMinute money,
-    PlanCreationTime datetime,
-    LastExecutionTime datetime,
-    PlanHandle varbinary(64),
-    SqlHandle varbinary(64),
-    QueryHash binary(8),
-    QueryPlanHash binary(8),
-    StatementStartOffset int,
-    StatementEndOffset int,
-    MinReturnedRows bigint,
-    MaxReturnedRows bigint,
-    AverageReturnedRows money,
-    TotalReturnedRows bigint,
-    LastReturnedRows bigint,
-    QueryText nvarchar(max),
-    QueryPlan xml,
-    /* these next four columns are the total for the type of query.
-        don't actually use them for anything apart from math by type.
-        */
-    TotalWorkerTimeForType bigint,
-    TotalElapsedTimeForType bigint,
-    TotalReadsForType bigint,
-    TotalExecutionCountForType bigint,
-    TotalWritesForType bigint,
-    NumberOfPlans int,
-    NumberOfDistinctPlans int,
-    min_worker_time bigint,
-    max_worker_time bigint,
-    is_forced_plan bit,
-    is_forced_parameterized bit,
-    is_cursor bit,
-    is_parallel bit,
-    frequent_execution bit,
-    parameter_sniffing bit,
-    unparameterized_query bit,
-    near_parallel bit,
-    plan_warnings bit,
-    plan_multiple_plans bit,
-    long_running bit,
-    downlevel_estimator bit,
-    implicit_conversions bit,
-    tempdb_spill bit,
-    busy_loops bit,
-    tvf_join bit,
-    tvf_estimate bit,
-    compile_timeout bit,
-    compile_memory_limit_exceeded bit,
-    warning_no_join_predicate bit,
-    QueryPlanCost float,
-    missing_index_count int,
-    unmatched_index_count int,
-    min_elapsed_time bigint,
-    max_elapsed_time bigint,
-    age_minutes money,
-    age_minutes_lifetime money,
-    is_trivial bit,
-    SetOptions VARCHAR(MAX),
-    Warnings VARCHAR(MAX)
-);
 
+
+SET @sql_handle = LTRIM(RTRIM(@sql_handle)) ;
 SET @only_query_hashes = LTRIM(RTRIM(@only_query_hashes)) ;
 SET @ignore_query_hashes = LTRIM(RTRIM(@ignore_query_hashes)) ;
+
+DECLARE @individual VARCHAR(100) ;
+
+IF @sql_handle IS NOT NULL
+    AND LEN(@sql_handle) > 0
+BEGIN
+    SET @individual = '';
+
+    WHILE LEN(@sql_handle) > 0
+    BEGIN
+        IF PATINDEX('%,%', @sql_handle) > 0
+        BEGIN  
+               SET @individual = SUBSTRING(@sql_handle, 0, PATINDEX('%,%',@sql_handle)) ;
+               
+               INSERT INTO #only_sql_handles
+               select cast('' as xml).value('xs:hexBinary( substring(sql:variable("@individual"), sql:column("t.pos")) )', 'varbinary(max)')
+               from (select case substring(@individual, 1, 2) when '0x' then 3 else 0 end) as t(pos)
+               
+               --SELECT CAST(SUBSTRING(@individual, 1, 2) AS BINARY(8));
+
+               SET @sql_handle = SUBSTRING(@sql_handle, LEN(@individual + ',') + 1, LEN(@sql_handle)) ;
+        END
+        ELSE
+        BEGIN
+               SET @individual = @sql_handle
+               SET @sql_handle = NULL
+
+               INSERT INTO #only_sql_handles
+               select cast('' as xml).value('xs:hexBinary( substring(sql:variable("@individual"), sql:column("t.pos")) )', 'varbinary(max)')
+               from (select case substring(@individual, 1, 2) when '0x' then 3 else 0 end) as t(pos)
+
+               --SELECT CAST(SUBSTRING(@individual, 1, 2) AS VARBINARY(MAX)) ;
+        END
+    END
+END    
 
 IF ((@only_query_hashes IS NOT NULL AND LEN(@only_query_hashes) > 0)
     OR (@ignore_query_hashes IS NOT NULL AND LEN(@ignore_query_hashes) > 0))
@@ -682,7 +775,7 @@ END
 IF @only_query_hashes IS NOT NULL
    AND LEN(@only_query_hashes) > 0
 BEGIN
-   DECLARE @individual VARCHAR(50) ;
+    SET @individual = '';
 
    WHILE LEN(@only_query_hashes) > 0
    BEGIN
@@ -778,7 +871,7 @@ SELECT CAST(SERVERPROPERTY('ProductVersion') as nvarchar(128))
 OPTION (RECOMPILE);
 
 
-SELECT @v = maj_version ,
+SELECT @v = common_version ,
        @build = build
 FROM   #checkversion
 OPTION (RECOMPILE);
@@ -786,7 +879,7 @@ OPTION (RECOMPILE);
 RAISERROR (N'Creating dynamic SQL based on SQL Server version.',0,1) WITH NOWAIT;
 
 SET @insert_list += N'
-INSERT INTO ##bou_BlitzCacheProcs (QueryType, DatabaseName, AverageCPU, TotalCPU, AverageCPUPerMinute, PercentCPUByType, PercentDurationByType,
+INSERT INTO ##bou_BlitzCacheProcs (SPID, QueryType, DatabaseName, AverageCPU, TotalCPU, AverageCPUPerMinute, PercentCPUByType, PercentDurationByType,
                     PercentReadsByType, PercentExecutionsByType, AverageDuration, TotalDuration, AverageReads, TotalReads, ExecutionCount,
                     ExecutionsPerMinute, TotalWrites, AverageWrites, PercentWritesByType, WritesPerMinute, PlanCreationTime,
                     LastExecutionTime, StatementStartOffset, StatementEndOffset, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows,
@@ -796,18 +889,24 @@ INSERT INTO ##bou_BlitzCacheProcs (QueryType, DatabaseName, AverageCPU, TotalCPU
 
 SET @body += N'
 FROM   (SELECT *,
-               CAST((CASE WHEN DATEDIFF(second, cached_time, GETDATE()) > 0 AND execution_count > 1
-                          THEN DATEDIFF(second, cached_time, GETDATE()) / 60.0
+               CAST((CASE WHEN DATEDIFF(mi, cached_time, GETDATE()) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, GETDATE()) 
                           ELSE NULL END) as MONEY) as age_minutes,
-               CAST((CASE WHEN DATEDIFF(second, cached_time, last_execution_time) > 0 AND execution_count > 1
-                          THEN DATEDIFF(second, cached_time, last_execution_time) / 60.0
+               CAST((CASE WHEN DATEDIFF(mi, cached_time, last_execution_time) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, last_execution_time) 
                           ELSE Null END) as MONEY) as age_minutes_lifetime
         FROM   sys.#view# x ' + @nl ;
 
+IF (SELECT COUNT(*) FROM #only_sql_handles) > 0
+BEGIN
+    SET @body += N'        WHERE  EXISTS(SELECT 1/0 FROM #only_sql_handles q WHERE q.sql_handle = x.sql_handle) ' + @nl ;
+END      
+
 IF (SELECT COUNT(*) FROM #only_query_hashes) > 0
    AND (SELECT COUNT(*) FROM #ignore_query_hashes) = 0
+   AND (SELECT COUNT(*) FROM #only_sql_handles) = 0
 BEGIN
-    SET @body += N'        WHERE  EXISTS(SELECT 1/0 FROM #only_query_hashes q WHERE q.query_hash = x.query_hash) ' + @nl
+    SET @body += N'        WHERE  EXISTS(SELECT 1/0 FROM #only_query_hashes q WHERE q.query_hash = x.query_hash) ' + @nl ;
 END
 
                           
@@ -824,11 +923,19 @@ SET @body += N') AS qs
 
 SET @body_where = N'WHERE  pa.attribute = ' + QUOTENAME('dbid', @q) + @nl ;
 
+SET @database_name = LTRIM(RTRIM(@database_name)) ;
+
+IF @database_name IS NOT NULL AND LEN(@database_name) > 0
+    SET @body_where += N'       AND CAST(pa.value AS INT) = DB_ID(' 
+                       + QUOTENAME(@database_name, '''')
+                       + ') ' + @nl ;
+
 IF @duration_filter IS NOT NULL
-   SET @body_where += N'       AND (total_elapsed_time / 1000.0) / execution_count > @min_duration ' + @nl ;
+    SET @body_where += N'       AND (total_elapsed_time / 1000.0) / execution_count > @min_duration ' + @nl ;
 
 SET @plans_triggers_select_list += N'
 SELECT TOP (@top)
+       @@SPID ,
        ''Procedure: '' + COALESCE(OBJECT_NAME(qs.object_id, qs.database_id),'''') AS QueryType,
        COALESCE(DB_NAME(database_id), CAST(pa.value AS sysname), ''-- N/A --'') AS DatabaseName,
        (total_worker_time / 1000.0) / execution_count AS AvgCPU ,
@@ -902,6 +1009,7 @@ BEGIN
     
     SET @sql += N'
     SELECT TOP (@top)
+           @@SPID ,
            ''Statement'' AS QueryType,
            COALESCE(DB_NAME(CAST(pa.value AS INT)), ''-- N/A --'') AS DatabaseName,
            (total_worker_time / 1000.0) / execution_count AS AvgCPU ,
@@ -1051,6 +1159,8 @@ BEGIN
 
    IF @ignore_system_db = 1
       SET @sql += ' AND COALESCE(DB_NAME(database_id), CAST(pa.value AS sysname), '''') NOT IN (''master'', ''model'', ''msdb'', ''tempdb'', ''32767'') ' + @nl ;
+   
+   SET @sql += @body_order + @nl + @nl + @nl ;
 END
 
 
@@ -1274,7 +1384,9 @@ SET NumberOfDistinctPlans = distinct_plan_count,
     missing_index_count = QueryPlan.value('count(//p:MissingIndexGroup)', 'int') ,
     unmatched_index_count = QueryPlan.value('count(//p:UnmatchedIndexes/p:Parameterization/p:Object)', 'int') ,
     plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN 1 END ,
-    is_trivial = CASE WHEN QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="TRIVIAL"]]/p:QueryPlan/p:ParameterList') = 1 THEN 1 END
+    is_trivial = CASE WHEN QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="TRIVIAL"]]/p:QueryPlan/p:ParameterList') = 1 THEN 1 END ,
+    SerialDesiredMemory = QueryPlan.value('sum(//p:MemoryGrantInfo/@SerialDesiredMemory)', 'float') ,
+    SerialRequiredMemory = QueryPlan.value('sum(//p:MemoryGrantInfo/@SerialRequiredMemory)', 'float')
 FROM (
 SELECT COUNT(DISTINCT QueryHash) AS distinct_plan_count,
        COUNT(QueryHash) AS number_of_plans,
@@ -1356,6 +1468,18 @@ SELECT  @ctp = CAST(value AS INT)
 FROM    sys.configurations
 WHERE   name = 'cost threshold for parallelism'
 OPTION (RECOMPILE);
+
+
+
+/* Update to grab stored procedure name for individual statements */
+UPDATE  p
+SET     QueryType = QueryType + ' (parent ' + 
+                    + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id, s.database_id))
+                    + '.'
+                    + QUOTENAME(OBJECT_NAME(s.object_id, s.database_id)) + ')'
+FROM    ##bou_BlitzCacheProcs p
+        JOIN sys.dm_exec_procedure_stats s ON p.SqlHandle = s.sql_handle
+WHERE   QueryType = 'Statement'
 
 
 
@@ -1540,6 +1664,8 @@ BEGIN
           QueryType nvarchar(256),
           Warnings varchar(max),
           DatabaseName sysname,
+          SerialDesiredMemory float,
+          SerialRequiredMemory float,
           AverageCPU bigint,
           TotalCPU bigint,
           PercentCPUByType money,
@@ -1590,13 +1716,15 @@ BEGIN
           + @output_table_name
           + N' (ServerName, Version, QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, CPUWeight, AverageDuration, TotalDuration, DurationWeight, PercentDurationByType, AverageReads, TotalReads, ReadWeight, PercentReadsByType, '
           + N' AverageWrites, TotalWrites, WriteWeight, PercentWritesByType, ExecutionCount, ExecutionWeight, PercentExecutionsByType, '
-          + N' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, PlanHandle, SqlHandle, QueryHash, StatementStartOffset, StatementEndOffset, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings) '
+          + N' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, PlanHandle, SqlHandle, QueryHash, StatementStartOffset, StatementEndOffset, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
+          + N' SerialRequiredMemory, SerialDesiredMemory) '
           + N'SELECT TOP (@top) '
           + QUOTENAME(CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(128)), N'''') + N', '
           + QUOTENAME(CAST(SERVERPROPERTY('ProductVersion') as nvarchar(128)), N'''') + ', '
           + N' QueryType, DatabaseName, AverageCPU, TotalCPU, PercentCPUByType, PercentCPU, AverageDuration, TotalDuration, PercentDuration, PercentDurationByType, AverageReads, TotalReads, PercentReads, PercentReadsByType, '
           + N' AverageWrites, TotalWrites, PercentWrites, PercentWritesByType, ExecutionCount, PercentExecutions, PercentExecutionsByType, '
-          + N' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, PlanHandle, SqlHandle, QueryHash, StatementStartOffset, StatementEndOffset, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings '
+          + N' ExecutionsPerMinute, PlanCreationTime, LastExecutionTime, PlanHandle, SqlHandle, QueryHash, StatementStartOffset, StatementEndOffset, MinReturnedRows, MaxReturnedRows, AverageReturnedRows, TotalReturnedRows, QueryText, QueryPlan, NumberOfPlans, NumberOfDistinctPlans, Warnings, '
+          + N' SerialRequiredMemory, SerialDesiredMemory '
           + N' FROM ##bou_BlitzCacheProcs '
           
     SELECT @insert_sql += N' ORDER BY ' + CASE @sort_order WHEN 'cpu' THEN ' TotalCPU '
@@ -1636,6 +1764,8 @@ BEGIN
             ExecutionsPerMinute AS [Executions / Minute],
             PercentExecutions AS [Execution Weight],
             PercentExecutionsByType AS [% Executions (Type)],
+            SerialDesiredMemory AS [Serial Desired Memory],
+            SerialRequiredMemory AS [Serial Required Memory],
             TotalCPU AS [Total CPU (ms)],
             AverageCPU AS [Avg CPU (ms)],
             PercentCPU AS [CPU Weight],
@@ -1693,8 +1823,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE frequent_execution =1)
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (1,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    1,
                     100,
                     'Execution Pattern',
                     'Frequently Executed Queries',
@@ -1707,8 +1838,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  parameter_sniffing = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (2,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    2,
                     50,
                     'Parameterization',
                     'Parameter Sniffing',
@@ -1720,8 +1852,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_forced_plan = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (3,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    3,
                     5,
                     'Parameterization',
                     'Forced Plans',
@@ -1733,8 +1866,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_cursor = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (4,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    4,
                     200,
                     'Cursors',
                     'Cursors',
@@ -1745,8 +1879,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_forced_parameterized = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (5,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    5,
                     50,
                     'Parameterization',
                     'Forced Parameterization',
@@ -1757,8 +1892,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  p.is_parallel = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (6,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    6,
                     200,
                     'Execution Plans',
                     'Parallelism',
@@ -1769,8 +1905,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  near_parallel = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (7,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    7,
                     200,
                     'Execution Plans',
                     'Nearly Parallel',
@@ -1781,8 +1918,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  plan_warnings = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (8,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    8,
                     50,
                     'Execution Plans',
                     'Query Plan Warnings',
@@ -1793,8 +1931,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  long_running = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (9,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    9,
                     50,
                     'Performance',
                     'Long Running Queries',
@@ -1806,8 +1945,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  p.missing_index_count > 0)
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (10,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    10,
                     50,
                     'Performance',
                     'Missing Index Request',
@@ -1818,8 +1958,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs p
                    WHERE  p.downlevel_estimator = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (13,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    13,
                     200,
                     'Cardinality',
                     'Legacy Cardinality Estimator in Use',
@@ -1830,8 +1971,9 @@ BEGIN
                    FROM ##bou_BlitzCacheProcs p
                    WHERE implicit_conversions = 1
                   )
-            INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-            VALUES (14,
+            INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+            VALUES (@@SPID,
+                    14,
                     50,
                     'Performance',
                     'Implicit Conversions',
@@ -1842,8 +1984,9 @@ BEGIN
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  tempdb_spill = 1
                   )
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (15,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                15,
                 10,
                 'Performance',
                 'TempDB Spills',
@@ -1853,8 +1996,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  busy_loops = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (16,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                16,
                 10,
                 'Performance',
                 'Frequently executed operators',
@@ -1864,8 +2008,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  tvf_join = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (17,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                17,
                 50,
                 'Performance',
                 'Joining to table valued functions',
@@ -1875,8 +2020,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  compile_timeout = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (18,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                18,
                 50,
                 'Execution Plans',
                 'Compilation timeout',
@@ -1886,8 +2032,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  compile_memory_limit_exceeded = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (19,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                19,
                 50,
                 'Execution Plans',
                 'Compilation memory limit exceeded',
@@ -1897,8 +2044,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  warning_no_join_predicate = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (20,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                20,
                 10,
                 'Execution Plans',
                 'No join predicate',
@@ -1908,8 +2056,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  plan_multiple_plans = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (21,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                21,
                 200,
                 'Execution Plans',
                 'Multiple execution plans',
@@ -1919,8 +2068,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  unmatched_index_count > 0)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (22,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                22,
                 100,
                 'Performance',
                 'Unmatched indexes',
@@ -1930,8 +2080,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  unparameterized_query = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (23,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                23,
                 100,
                 'Parameterization',
                 'Unparameterized queries',
@@ -1941,8 +2092,9 @@ BEGIN
         IF EXISTS (SELECT 1/0
                    FROM   ##bou_BlitzCacheProcs
                    WHERE  is_trivial = 1)
-        INSERT INTO ##bou_BlitzCacheResults (CheckID, Priority, FindingsGroup, Finding, URL, Details)
-        VALUES (24,
+        INSERT INTO ##bou_BlitzCacheResults (SPID, CheckID, Priority, FindingsGroup, Finding, URL, Details)
+        VALUES (@@SPID,
+                24,
                 100,
                 'Execution Plans',
                 'Trivial Plans',
@@ -1960,6 +2112,7 @@ BEGIN
             Details,
             CheckID
     FROM    ##bou_BlitzCacheResults
+    WHERE   SPID = @@SPID
     GROUP BY Priority,
             FindingsGroup,
             Finding,
@@ -2061,6 +2214,8 @@ BEGIN
     SET @columns += N'        ExecutionCount AS [# Executions],
         ExecutionsPerMinute AS [Executions / Minute],
         PercentExecutions AS [Execution Weight],
+        SerialDesiredMemory AS [Serial Desired Memory],
+        SerialRequiredMemory AS [Serial Required Memory],
         TotalCPU AS [Total CPU (ms)],
         AverageCPU AS [Avg CPU (ms)],
         PercentCPU AS [CPU Weight],
@@ -2101,7 +2256,7 @@ END
 SET @sql = N'
 SELECT  TOP (@top) ' + @columns + @nl + N'
 FROM    ##bou_BlitzCacheProcs
-WHERE   1 = 1 ' + @nl
+WHERE   SPID = @spid ' + @nl
 
 SELECT @sql += N' ORDER BY ' + CASE @sort_order WHEN 'cpu' THEN ' TotalCPU '
                                                 WHEN 'reads' THEN ' TotalReads '
@@ -2116,7 +2271,7 @@ SELECT @sql += N' ORDER BY ' + CASE @sort_order WHEN 'cpu' THEN ' TotalCPU '
                                END + N' DESC '
 SET @sql += N' OPTION (RECOMPILE) ; '
 
-EXEC sp_executesql @sql, N'@top INT', @top ;
+EXEC sp_executesql @sql, N'@top INT, @spid INT', @top, @@SPID ;
 
 
 GO

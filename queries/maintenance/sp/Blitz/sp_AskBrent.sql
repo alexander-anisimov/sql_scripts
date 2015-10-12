@@ -1,6 +1,3 @@
-USE [master];
-GO
-
 IF OBJECT_ID('dbo.sp_AskBrent') IS NULL
   EXEC ('CREATE PROCEDURE dbo.sp_AskBrent AS RETURN 0;')
 GO
@@ -57,6 +54,20 @@ Known limitations of this version:
 
 Unknown limitations of this version:
  - None. Like Zombo.com, the only limit is yourself.
+
+Changes in v16 - July 18, 2015
+ - Azure SQL Database compatibility.
+ - Temporarily removing CheckID 5, Query Problems - Long-Running Query Blocking
+   Others. This one is typically the slowest check on heavily active systems,
+   and it doesn't work in Azure, and I'm lazy.
+
+Changes in v15 - June 10, 2015
+ - If @Seconds = 0, return results since the time the server restarted. Only
+   useful for @ExpertMode = 1 for now, though - I'm filtering out most of the
+   "live" checks near the end. I'll enable those back in over time I fix them.
+ - Added Server Info output of priority 250 for Compiles and Recompiles per
+   Second when @ExpertMode = 1. (Checks 25 and 26)
+ - Fixed a bug where many checks weren't working for named instances.
 
 Changes in v14 - Mar 1, 2015
  - Added CPU utilization >50% check, plus informational log (checks 23 and 24).
@@ -159,7 +170,7 @@ Changes in v1 - July 11, 2013
 */
 
 
-SELECT @Version = 14, @VersionDate = '20150301'
+SELECT @Version = 16, @VersionDate = '20150718'
 
 DECLARE @StringToExecute NVARCHAR(4000),
 	@ParmDefinitions NVARCHAR(4000),
@@ -185,8 +196,15 @@ SELECT
 	@LineFeed = CHAR(13) + CHAR(10),
 	@StartSampleTime = GETDATE(),
 	@FinishSampleTime = DATEADD(ss, @Seconds, GETDATE()),
-	@OurSessionID = @@SPID,
-	@ServiceName = CASE WHEN @@SERVICENAME = 'MSSQLSERVER' THEN 'SQLServer' ELSE 'MSSQL$' + @@SERVICENAME END;
+	@OurSessionID = @@SPID
+
+
+IF @Seconds = 0
+	SELECT @StartSampleTime = create_date , @FinishSampleTime = GETDATE()
+		FROM sys.databases 
+		WHERE database_id = 2;
+ELSE
+	SELECT @StartSampleTime = GETDATE(), @FinishSampleTime = DATEADD(ss, @Seconds, GETDATE());
 
 IF @OutputType = 'SCHEMA'
 BEGIN
@@ -340,6 +358,16 @@ BEGIN
 		DROP TABLE #FilterPlansByDatabase;
 	CREATE TABLE #FilterPlansByDatabase (DatabaseID INT PRIMARY KEY CLUSTERED);
 
+	IF OBJECT_ID('tempdb..#MasterFiles') IS NOT NULL 
+		DROP TABLE #MasterFiles;
+	CREATE TABLE #MasterFiles (database_id INT, file_id INT, type_desc NVARCHAR(50), name NVARCHAR(50), physical_name NVARCHAR(255), size BIGINT);
+	/* Azure SQL Database doesn't have sys.master_files, so we have to build our own. */
+	IF CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
+		SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT DB_ID(), file_id, type_desc, name, physical_name, size FROM sys.database_files;'
+	ELSE
+		SET @StringToExecute = 'INSERT INTO #MasterFiles (database_id, file_id, type_desc, name, physical_name, size) SELECT database_id, file_id, type_desc, name, physical_name, size FROM sys.master_files;'
+	EXEC(@StringToExecute);
+
 	IF @FilterPlansByDatabase IS NOT NULL
 		BEGIN
 		IF UPPER(LEFT(@FilterPlansByDatabase,4)) = 'USER'
@@ -378,6 +406,18 @@ BEGIN
 	SELECT @StockWarningFooter = @LineFeed + @LineFeed + '-- ?>',
 		@StockDetailsHeader = '<?ClickToSeeDetails -- ' + @LineFeed,
 		@StockDetailsFooter = @LineFeed + ' -- ?>';
+
+	/* Get the instance name to use as a Perfmon counter prefix. */
+	IF CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) = 'SQL Azure'
+		SELECT TOP 1 @ServiceName = LEFT(object_name, (CHARINDEX(':', object_name) - 1))
+		FROM sys.dm_os_performance_counters;
+	ELSE
+		BEGIN
+		SET @StringToExecute = 'INSERT INTO #PerfmonStats(object_name, Pass, SampleTime, counter_name, cntr_type) SELECT CASE WHEN @@SERVICENAME = ''MSSQLSERVER'' THEN ''SQLServer'' ELSE ''MSSQL$'' + @@SERVICENAME END, 0, GETDATE(), ''stuffing'', 0 ;'
+		EXEC(@StringToExecute);
+		SELECT @ServiceName = object_name FROM #PerfmonStats;
+		DELETE #PerfmonStats;
+		END
 
 	/* Build a list of queries that were run in the last 10 seconds.
 	   We're looking for the death-by-a-thousand-small-cuts scenario
@@ -526,11 +566,11 @@ BEGIN
 	INSERT #WaitStats(Pass, SampleTime, wait_type, wait_time_ms, signal_wait_time_ms, waiting_tasks_count)
 	SELECT
 		1 AS Pass,
-		GETDATE() AS SampleTime,
+		CASE @Seconds WHEN 0 THEN @StartSampleTime ELSE GETDATE() END AS SampleTime,
 		os.wait_type,
-		SUM(os.wait_time_ms) OVER (PARTITION BY os.wait_type) as sum_wait_time_ms,
-		SUM(os.signal_wait_time_ms) OVER (PARTITION BY os.wait_type ) as sum_signal_wait_time_ms,
-		SUM(os.waiting_tasks_count) OVER (PARTITION BY os.wait_type) AS sum_waiting_tasks
+		CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.wait_time_ms) OVER (PARTITION BY os.wait_type) END as sum_wait_time_ms,
+		CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.signal_wait_time_ms) OVER (PARTITION BY os.wait_type ) END as sum_signal_wait_time_ms,
+		CASE @Seconds WHEN 0 THEN 0 ELSE SUM(os.waiting_tasks_count) OVER (PARTITION BY os.wait_type) END AS sum_waiting_tasks
 	FROM sys.dm_os_wait_stats os
 	WHERE os.wait_type not in (
 		'REQUEST_FOR_DEADLOCK_SEARCH',
@@ -568,7 +608,8 @@ BEGIN
 		'HADR_TIMER_TASK',
 		'HADR_WORK_QUEUE',
 		'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
-		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP'
+		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+		'RESOURCE_GOVERNOR_IDLE'
 	)
 	ORDER BY sum_wait_time_ms DESC;
 
@@ -577,42 +618,43 @@ BEGIN
 		num_of_reads, [bytes_read] , io_stall_write_ms,num_of_writes, [bytes_written], PhysicalName, TypeDesc)
 	SELECT 
 		1 AS Pass,
-		GETDATE() AS SampleTime,
+		CASE @Seconds WHEN 0 THEN @StartSampleTime ELSE GETDATE() END AS SampleTime,
 		mf.[database_id],
 		mf.[file_id],
 		DB_NAME(vfs.database_id) AS [db_name], 
 		mf.name + N' [' + mf.type_desc COLLATE SQL_Latin1_General_CP1_CI_AS + N']' AS file_logical_name ,
 		CAST(( ( vfs.size_on_disk_bytes / 1024.0 ) / 1024.0 ) AS INT) AS size_on_disk_mb ,
-		vfs.io_stall_read_ms ,
-		vfs.num_of_reads ,
-		vfs.[num_of_bytes_read],
-		vfs.io_stall_write_ms ,
-		vfs.num_of_writes ,
-		vfs.[num_of_bytes_written],
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.io_stall_read_ms END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.num_of_reads END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.[num_of_bytes_read] END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.io_stall_write_ms END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.num_of_writes END ,
+		CASE @Seconds WHEN 0 THEN 0 ELSE vfs.[num_of_bytes_written] END ,
 		mf.physical_name,
 		mf.type_desc
 	FROM sys.dm_io_virtual_file_stats (NULL, NULL) AS vfs
-	INNER JOIN sys.master_files AS mf ON vfs.file_id = mf.file_id
+	INNER JOIN #MasterFiles AS mf ON vfs.file_id = mf.file_id
 		AND vfs.database_id = mf.database_id
 	WHERE vfs.num_of_reads > 0
 		OR vfs.num_of_writes > 0;
 
 	INSERT INTO #PerfmonStats (Pass, SampleTime, [object_name],[counter_name],[instance_name],[cntr_value],[cntr_type])
 	SELECT 		1 AS Pass,
-		GETDATE() AS SampleTime, RTRIM(dmv.object_name), RTRIM(dmv.counter_name), RTRIM(dmv.instance_name), dmv.cntr_value, dmv.cntr_type
+		CASE @Seconds WHEN 0 THEN @StartSampleTime ELSE GETDATE() END AS SampleTime, RTRIM(dmv.object_name), RTRIM(dmv.counter_name), RTRIM(dmv.instance_name), CASE @Seconds WHEN 0 THEN 0 ELSE dmv.cntr_value END, dmv.cntr_type
 		FROM #PerfmonCounters counters
-		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name = RTRIM(dmv.counter_name)
-			AND counters.[object_name] = RTRIM(dmv.[object_name])
-			AND (counters.[instance_name] IS NULL OR counters.[instance_name] = RTRIM(dmv.[instance_name]))
+		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.counter_name) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND counters.[object_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[object_name]) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND (counters.[instance_name] IS NULL OR counters.[instance_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[instance_name]) COLLATE SQL_Latin1_General_CP1_CI_AS)
 
 	/* Maintenance Tasks Running - Backup Running - CheckID 1 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 1 AS CheckID,
 		1 AS Priority,
 		'Maintenance Tasks Running' AS FindingGroup,
 		'Backup Running' AS Finding,
 		'http://BrentOzar.com/askbrent/backups/' AS URL,
-		'Backup of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM sys.master_files WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
+		'Backup of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
 		'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
 		pl.query_plan AS QueryPlan,
 		r.start_time AS StartTime,
@@ -638,21 +680,22 @@ BEGIN
 
 
 	/* If there's a backup running, add details explaining how long full backup has been taking in the last month. */
-	UPDATE #AskBrentResults
-	SET Details = Details + ' Over the last 60 days, the full backup usually takes ' + CAST((SELECT AVG(DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date)) FROM msdb.dbo.backupset bs WHERE abr.DatabaseName = bs.database_name AND bs.type = 'D' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL) AS NVARCHAR(100)) + ' minutes.'
-	FROM #AskBrentResults abr
-	WHERE abr.CheckID = 1 AND EXISTS (SELECT * FROM msdb.dbo.backupset bs WHERE bs.type = 'D' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL AND abr.DatabaseName = bs.database_name AND DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date) > 1)
-
+	IF @Seconds > 0 AND CAST(SERVERPROPERTY('edition') AS VARCHAR(100)) <> 'SQL Azure'
+	BEGIN
+		SET @StringToExecute = 'UPDATE #AskBrentResults SET Details = Details + '' Over the last 60 days, the full backup usually takes '' + CAST((SELECT AVG(DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date)) FROM msdb.dbo.backupset bs WHERE abr.DatabaseName = bs.database_name AND bs.type = ''D'' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL) AS NVARCHAR(100)) + '' minutes.'' FROM #AskBrentResults abr WHERE abr.CheckID = 1 AND EXISTS (SELECT * FROM msdb.dbo.backupset bs WHERE bs.type = ''D'' AND bs.backup_start_date > DATEADD(dd, -60, GETDATE()) AND bs.backup_finish_date IS NOT NULL AND abr.DatabaseName = bs.database_name AND DATEDIFF(mi, bs.backup_start_date, bs.backup_finish_date) > 1)';
+		EXEC(@StringToExecute);
+	END
 
 
 	/* Maintenance Tasks Running - DBCC Running - CheckID 2 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 2 AS CheckID,
 		1 AS Priority,
 		'Maintenance Tasks Running' AS FindingGroup,
 		'DBCC Running' AS Finding,
 		'http://BrentOzar.com/askbrent/dbcc/' AS URL,
-		'Corruption check of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM sys.master_files WHERE database_id = db.resource_database_id) + 'GB) has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
+		'Corruption check of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
 		'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
 		pl.query_plan AS QueryPlan,
 		r.start_time AS StartTime,
@@ -678,13 +721,14 @@ BEGIN
 
 
 	/* Maintenance Tasks Running - Restore Running - CheckID 3 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 3 AS CheckID,
 		1 AS Priority,
 		'Maintenance Tasks Running' AS FindingGroup,
 		'Restore Running' AS Finding,
 		'http://BrentOzar.com/askbrent/backups/' AS URL,
-		'Restore of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM sys.master_files WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
+		'Restore of ' + DB_NAME(db.resource_database_id) + ' database (' + (SELECT CAST(CAST(SUM(size * 8.0 / 1024 / 1024) AS BIGINT) AS NVARCHAR) FROM #MasterFiles WHERE database_id = db.resource_database_id) + 'GB) is ' + CAST(r.percent_complete AS NVARCHAR(100)) + '% complete, has been running since ' + CAST(r.start_time AS NVARCHAR(100)) + '. ' AS Details,
 		'KILL ' + CAST(r.session_id AS NVARCHAR(100)) + ';' AS HowToStopIt,
 		pl.query_plan AS QueryPlan,
 		r.start_time AS StartTime,
@@ -710,6 +754,7 @@ BEGIN
 
 
 	/* SQL Server Internal Maintenance - Database File Growing - CheckID 4 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 4 AS CheckID,
 		1 AS Priority,
@@ -736,6 +781,8 @@ BEGIN
 
 
 	/* Query Problems - Long-Running Query Blocking Others - CheckID 5 */
+	/*
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, QueryPlan, QueryText, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, OpenTransactionCount)
 	SELECT 5 AS CheckID,
 		1 AS Priority,
@@ -771,6 +818,7 @@ BEGIN
 	LEFT OUTER JOIN sys.dm_exec_requests rBlocker ON tBlocked.blocking_session_id = rBlocker.session_id
 	  WHERE NOT EXISTS (SELECT * FROM sys.dm_os_waiting_tasks tBlocker WHERE tBlocker.session_id = tBlocked.blocking_session_id AND tBlocker.blocking_session_id IS NOT NULL)
 	  AND s.last_request_start_time < DATEADD(SECOND, -30, GETDATE())
+	*/
 
 	/* Query Problems - Plan Cache Erased Recently */
 	IF DATEADD(mi, -15, GETDATE()) < (SELECT TOP 1 creation_time FROM sys.dm_exec_query_stats ORDER BY creation_time)
@@ -793,6 +841,7 @@ BEGIN
 
 
 	/* Query Problems - Sleeping Query with Open Transactions - CheckID 8 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText, OpenTransactionCount)
 	SELECT 8 AS CheckID,
 		50 AS Priority,
@@ -827,6 +876,7 @@ BEGIN
 
 
 	/* Query Problems - Query Rolling Back - CheckID 9 */
+	IF @Seconds > 0
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, HowToStopIt, StartTime, LoginName, NTUserName, ProgramName, HostName, DatabaseID, DatabaseName, QueryText)
 	SELECT 9 AS CheckID,
 		1 AS Priority,
@@ -881,7 +931,7 @@ BEGIN
 		CAST(CAST(SUM (size)*8./1024./1024. AS BIGINT) AS VARCHAR(100)) AS Details,
         SUM (size)*8./1024./1024. AS DetailsInt,
         'http://www.BrentOzar.com/askbrent/' AS URL
-	FROM sys.master_files
+	FROM #MasterFiles
 	WHERE database_id > 4
 
 	/* Server Info - Database Count - CheckID 22 */
@@ -984,7 +1034,8 @@ BEGIN
 		'HADR_TIMER_TASK',
 		'HADR_WORK_QUEUE',
 		'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP',
-		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP'
+		'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+		'RESOURCE_GOVERNOR_IDLE'
 	)
 	ORDER BY sum_wait_time_ms DESC;
 
@@ -1008,7 +1059,7 @@ BEGIN
 		0,
 		0
 	FROM sys.dm_io_virtual_file_stats (NULL, NULL) AS vfs
-	INNER JOIN sys.master_files AS mf ON vfs.file_id = mf.file_id
+	INNER JOIN #MasterFiles AS mf ON vfs.file_id = mf.file_id
 		AND vfs.database_id = mf.database_id
 	WHERE vfs.num_of_reads > 0
 		OR vfs.num_of_writes > 0;
@@ -1018,9 +1069,9 @@ BEGIN
 		GETDATE() AS SampleTime,
 		RTRIM(dmv.object_name), RTRIM(dmv.counter_name), RTRIM(dmv.instance_name), dmv.cntr_value, dmv.cntr_type
 		FROM #PerfmonCounters counters
-		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name = RTRIM(dmv.counter_name)
-			AND counters.[object_name] = RTRIM(dmv.[object_name])
-			AND (counters.[instance_name] IS NULL OR counters.[instance_name] = RTRIM(dmv.[instance_name]))
+		INNER JOIN sys.dm_os_performance_counters dmv ON counters.counter_name COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.counter_name) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND counters.[object_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[object_name]) COLLATE SQL_Latin1_General_CP1_CI_AS
+			AND (counters.[instance_name] IS NULL OR counters.[instance_name] COLLATE SQL_Latin1_General_CP1_CI_AS = RTRIM(dmv.[instance_name]) COLLATE SQL_Latin1_General_CP1_CI_AS)
 
 	/* Set the latencies and averages. We could do this with a CTE, but we're not ambitious today. */
 	UPDATE fNow
@@ -1040,7 +1091,8 @@ BEGIN
 			[value_per_second] = ((1.0 * pNow.cntr_value - pFirst.cntr_value) / DATEDIFF(ss, pFirst.SampleTime, pNow.SampleTime)) 
 		FROM #PerfmonStats pNow
 			INNER JOIN #PerfmonStats pFirst ON pFirst.[object_name] = pNow.[object_name] AND pFirst.counter_name = pNow.counter_name AND (pFirst.instance_name = pNow.instance_name OR (pFirst.instance_name IS NULL AND pNow.instance_name IS NULL))
-				AND pNow.ID > pFirst.ID;
+				AND pNow.ID > pFirst.ID
+		WHERE  DATEDIFF(ss, pFirst.SampleTime, pNow.SampleTime) > 0;
 
 
 	/* If we're within 10 seconds of our projected finish time, do the plan cache analysis. */
@@ -1198,12 +1250,12 @@ BEGIN
 		'Wait Stats' AS FindingGroup,
 		wNow.wait_type AS Finding,
 		N'http://www.brentozar.com/sql/wait-stats/#' + wNow.wait_type AS URL,
-		'For ' + CAST(((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS NVARCHAR(100)) + ' seconds over the last ' + CAST(@Seconds AS NVARCHAR(10)) + ' seconds, SQL Server was waiting on this particular bottleneck.' + @LineFeed + @LineFeed AS Details,
+		'For ' + CAST(((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS NVARCHAR(100)) + ' seconds over the last ' + CASE @Seconds WHEN 0 THEN (CAST(DATEDIFF(dd,@StartSampleTime,@FinishSampleTime) AS NVARCHAR(10)) + ' days') ELSE (CAST(@Seconds AS NVARCHAR(10)) + ' seconds') END + ', SQL Server was waiting on this particular bottleneck.' + @LineFeed + @LineFeed AS Details,
 		'See the URL for more details on how to mitigate this wait type.' AS HowToStopIt,
         ((wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) / 1000) AS DetailsInt
 	FROM #WaitStats wNow
 	LEFT OUTER JOIN #WaitStats wBase ON wNow.wait_type = wBase.wait_type AND wNow.SampleTime > wBase.SampleTime
-	WHERE wNow.wait_time_ms > (wBase.wait_time_ms + (.5 * @Seconds * 1000)) /* Only look for things we've actually waited on for half of the time or more */
+	WHERE wNow.wait_time_ms > (wBase.wait_time_ms + (.5 * (DATEDIFF(ss,@StartSampleTime,@FinishSampleTime)) * 1000)) /* Only look for things we've actually waited on for half of the time or more */
 	ORDER BY (wNow.wait_time_ms - COALESCE(wBase.wait_time_ms,0)) DESC;
 
 	/* Server Performance - Slow Data File Reads - CheckID 11 */
@@ -1261,7 +1313,7 @@ BEGIN
 		'Pre-grow data and log files during maintenance windows so that they do not grow during production loads. See the URL for more details.'  AS HowToStopIt
 	FROM #PerfmonStats ps
 	WHERE ps.Pass = 2
-		AND object_name = 'SQLServer:Databases'
+		AND object_name = @ServiceName + ':Databases'
 		AND counter_name = 'Log Growths'
 		AND value_delta > 0
 
@@ -1278,7 +1330,7 @@ BEGIN
 		'Pre-grow data and log files during maintenance windows so that they do not grow during production loads. See the URL for more details.' AS HowToStopIt
 	FROM #PerfmonStats ps
 	WHERE ps.Pass = 2
-		AND object_name = 'SQLServer:Databases'
+		AND object_name = @ServiceName + ':Databases'
 		AND counter_name = 'Log Shrinks'
 		AND value_delta > 0
 
@@ -1294,9 +1346,9 @@ BEGIN
 			+ 'For OLTP environments, Microsoft recommends that 90% of batch requests should hit the plan cache, and not be compiled from scratch. We are exceeding that threshold.' + @LineFeed AS Details,
 		'Find out why plans are not being reused, and consider enabling Forced Parameterization. See the URL for more details.' AS HowToStopIt
 	FROM #PerfmonStats ps
-		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = 'SQLServer:SQL Statistics' AND psComp.counter_name = 'SQL Compilations/sec' AND psComp.value_delta > 0
+		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = @ServiceName + ':SQL Statistics' AND psComp.counter_name = 'SQL Compilations/sec' AND psComp.value_delta > 0
 	WHERE ps.Pass = 2
-		AND ps.object_name = 'SQLServer:SQL Statistics'
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
 		AND ps.counter_name = 'Batch Requests/sec'
 		AND ps.value_delta > (1000 * @Seconds) /* Ignore servers sitting idle */
 		AND (psComp.value_delta * 10) > ps.value_delta /* Compilations are more than 10% of batch requests per second */
@@ -1313,9 +1365,9 @@ BEGIN
 			+ 'More than 10% of our queries are being recompiled. This is typically due to statistics changing on objects.' + @LineFeed AS Details,
 		'Find out which objects are changing so quickly that they hit the stats update threshold. See the URL for more details.' AS HowToStopIt
 	FROM #PerfmonStats ps
-		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = 'SQLServer:SQL Statistics' AND psComp.counter_name = 'SQL Re-Compilations/sec' AND psComp.value_delta > 0
+		INNER JOIN #PerfmonStats psComp ON psComp.Pass = 2 AND psComp.object_name = @ServiceName + ':SQL Statistics' AND psComp.counter_name = 'SQL Re-Compilations/sec' AND psComp.value_delta > 0
 	WHERE ps.Pass = 2
-		AND ps.object_name = 'SQLServer:SQL Statistics'
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
 		AND ps.counter_name = 'Batch Requests/sec'
 		AND ps.value_delta > (1000 * @Seconds) /* Ignore servers sitting idle */
 		AND (psComp.value_delta * 10) > ps.value_delta /* Recompilations are more than 10% of batch requests per second */
@@ -1332,21 +1384,58 @@ BEGIN
 	FROM #PerfmonStats ps
         INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
 	WHERE ps.Pass = 2
-		AND ps.object_name = 'SQLServer:SQL Statistics'
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
 		AND ps.counter_name = 'Batch Requests/sec';
+
+
+		INSERT INTO #PerfmonCounters ([object_name],[counter_name],[instance_name]) VALUES (@ServiceName + ':SQL Statistics','SQL Compilations/sec', NULL)
+		INSERT INTO #PerfmonCounters ([object_name],[counter_name],[instance_name]) VALUES (@ServiceName + ':SQL Statistics','SQL Re-Compilations/sec', NULL)
+
+	/* Server Info - SQL Compilations/sec - CheckID 25 */
+    IF @ExpertMode = 1
+	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
+	SELECT 25 AS CheckID,
+		250 AS Priority,
+		'Server Info' AS FindingGroup,
+		'SQL Compilations per Sec' AS Finding,
+		'http://BrentOzar.com/go/measure' AS URL,
+		CAST(ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS NVARCHAR(20)) AS Details,
+        ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS DetailsInt
+	FROM #PerfmonStats ps
+        INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
+	WHERE ps.Pass = 2
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
+		AND ps.counter_name = 'SQL Compilations/sec';
+
+	/* Server Info - SQL Re-Compilations/sec - CheckID 26 */
+    IF @ExpertMode = 1
+	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
+	SELECT 26 AS CheckID,
+		250 AS Priority,
+		'Server Info' AS FindingGroup,
+		'SQL Re-Compilations per Sec' AS Finding,
+		'http://BrentOzar.com/go/measure' AS URL,
+		CAST(ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS NVARCHAR(20)) AS Details,
+        ps.value_delta / (DATEDIFF(ss, ps1.SampleTime, ps.SampleTime)) AS DetailsInt
+	FROM #PerfmonStats ps
+        INNER JOIN #PerfmonStats ps1 ON ps.object_name = ps1.object_name AND ps.counter_name = ps1.counter_name AND ps1.Pass = 1
+	WHERE ps.Pass = 2
+		AND ps.object_name = @ServiceName + ':SQL Statistics'
+		AND ps.counter_name = 'SQL Re-Compilations/sec';
 
 	/* Server Info - Wait Time per Core per Sec - CheckID 20 */
     WITH waits1(SampleTime, waits_ms) AS (SELECT SampleTime, SUM(ws1.wait_time_ms) FROM #WaitStats ws1 WHERE ws1.Pass = 1 GROUP BY SampleTime),
-    waits2(SampleTime, waits_ms) AS (SELECT SampleTime, SUM(ws2.wait_time_ms) FROM #WaitStats ws2 WHERE ws2.Pass = 2 GROUP BY SampleTime)
+    waits2(SampleTime, waits_ms) AS (SELECT SampleTime, SUM(ws2.wait_time_ms) FROM #WaitStats ws2 WHERE ws2.Pass = 2 GROUP BY SampleTime),
+	cores(cpu_count) AS (SELECT SUM(1) FROM sys.dm_os_schedulers WHERE status = 'VISIBLE ONLINE' AND is_online = 1)
 	INSERT INTO #AskBrentResults (CheckID, Priority, FindingsGroup, Finding, URL, Details, DetailsInt)
 	SELECT 19 AS CheckID,
 		250 AS Priority,
 		'Server Info' AS FindingGroup,
 		'Wait Time per Core per Sec' AS Finding,
 		'http://BrentOzar.com/go/measure' AS URL,
-		CAST((waits2.waits_ms - waits1.waits_ms) / i.cpu_count / DATEDIFF(ms, waits1.SampleTime, waits2.SampleTime) AS NVARCHAR(20)) AS Details,
-        (waits2.waits_ms - waits1.waits_ms) / i.cpu_count / DATEDIFF(ms, waits1.SampleTime, waits2.SampleTime) AS DetailsInt
-	FROM sys.dm_os_sys_info i
+		CAST((waits2.waits_ms - waits1.waits_ms) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS NVARCHAR(20)) AS Details,
+        (waits2.waits_ms - waits1.waits_ms) / 1000 / i.cpu_count / DATEDIFF(ss, waits1.SampleTime, waits2.SampleTime) AS DetailsInt
+	FROM cores i
       CROSS JOIN waits1
       CROSS JOIN waits2;
 
@@ -1408,8 +1497,6 @@ BEGIN
 				);
 		
 	END /*IF NOT EXISTS (SELECT * FROM #AskBrentResults) */
-	ELSE /* We found stuff, so add credits */
-	BEGIN
 
 		/* Add credits for the nice folks who put so much time into building and maintaining this for free: */                    
 		INSERT  INTO #AskBrentResults
@@ -1445,7 +1532,6 @@ BEGIN
 				  'Thanks from the Brent Ozar Unlimited team.  We hope you found this tool useful, and if you need help relieving your SQL Server pains, email us at Help@BrentOzar.com.'
 				);
 
-	END /* ELSE  We found stuff, so add credits */
 
 	/* @OutputTableName lets us export the results to a permanent table */
 	IF @OutputDatabaseName IS NOT NULL
@@ -1898,6 +1984,7 @@ BEGIN
 					[QueryText],
 					[QueryPlan]
 			FROM    #AskBrentResults
+			WHERE (@Seconds > 0 OR (Priority IN (0, 250, 251, 255))) /* For @Seconds = 0, filter out broken checks for now */
 			ORDER BY Priority ,
 					FindingsGroup ,
 					CASE
@@ -1918,6 +2005,7 @@ BEGIN
 					CAST([QueryText] AS NVARCHAR(MAX)) AS QueryText,
 					CAST([QueryPlan] AS NVARCHAR(MAX)) AS QueryPlan
 			FROM    #AskBrentResults
+			WHERE (@Seconds > 0 OR (Priority IN (0, 250, 251, 255))) /* For @Seconds = 0, filter out broken checks for now */
 			ORDER BY Priority ,
 					FindingsGroup ,
 					CASE
@@ -1974,6 +2062,7 @@ BEGIN
 				LEFT OUTER JOIN #QueryStats qsTotalFirst ON qsTotalFirst.Pass = -1
 				LEFT OUTER JOIN #QueryStats qsNow ON r.QueryStatsNowID = qsNow.ID
                 LEFT OUTER JOIN #QueryStats qsFirst ON r.QueryStatsFirstID = qsFirst.ID
+			WHERE (@Seconds > 0 OR (Priority IN (0, 250, 251, 255))) /* For @Seconds = 0, filter out broken checks for now */
 			ORDER BY r.Priority ,
 					r.FindingsGroup ,
 					CASE
