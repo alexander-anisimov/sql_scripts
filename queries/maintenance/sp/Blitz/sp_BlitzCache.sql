@@ -13,9 +13,112 @@ IF OBJECT_ID('dbo.sp_BlitzCache') IS NOT NULL AND OBJECT_ID('tempdb.dbo.##bou_Bl
     EXEC ('DROP TABLE ##bou_BlitzCacheResults;')
 GO
 
+CREATE TABLE ##bou_BlitzCacheResults (
+    SPID INT,
+    ID INT IDENTITY(1,1),
+    CheckID INT,
+    Priority TINYINT,
+    FindingsGroup VARCHAR(50),
+    Finding VARCHAR(200),
+    URL VARCHAR(200),
+    Details VARCHAR(4000) 
+);
+
+CREATE TABLE ##bou_BlitzCacheProcs (
+    SPID INT ,
+    QueryType nvarchar(256),
+    DatabaseName sysname,
+    AverageCPU decimal(38,4),
+    AverageCPUPerMinute decimal(38,4),
+    TotalCPU decimal(38,4),
+    PercentCPUByType money,
+    PercentCPU money,
+    AverageDuration decimal(38,4),
+    TotalDuration decimal(38,4),
+    PercentDuration money,
+    PercentDurationByType money,
+    AverageReads bigint,
+    TotalReads bigint,
+    PercentReads money,
+    PercentReadsByType money,
+    ExecutionCount bigint,
+    PercentExecutions money,
+    PercentExecutionsByType money,
+    ExecutionsPerMinute money,
+    TotalWrites bigint,
+    AverageWrites money,
+    PercentWrites money,
+    PercentWritesByType money,
+    WritesPerMinute money,
+    PlanCreationTime datetime,
+    LastExecutionTime datetime,
+    PlanHandle varbinary(64),
+    SqlHandle varbinary(64),
+    QueryHash binary(8),
+    QueryPlanHash binary(8),
+    StatementStartOffset int,
+    StatementEndOffset int,
+    MinReturnedRows bigint,
+    MaxReturnedRows bigint,
+    AverageReturnedRows money,
+    TotalReturnedRows bigint,
+    LastReturnedRows bigint,
+    QueryText nvarchar(max),
+    QueryPlan xml,
+    /* these next four columns are the total for the type of query.
+        don't actually use them for anything apart from math by type.
+        */
+    TotalWorkerTimeForType bigint,
+    TotalElapsedTimeForType bigint,
+    TotalReadsForType bigint,
+    TotalExecutionCountForType bigint,
+    TotalWritesForType bigint,
+    NumberOfPlans int,
+    NumberOfDistinctPlans int,
+    SerialDesiredMemory float,
+    SerialRequiredMemory float,
+    CachedPlanSize float,
+    CompileTime float,
+    CompileCPU float ,
+    CompileMemory float ,
+    min_worker_time bigint,
+    max_worker_time bigint,
+    is_forced_plan bit,
+    is_forced_parameterized bit,
+    is_cursor bit,
+    is_parallel bit,
+    frequent_execution bit,
+    parameter_sniffing bit,
+    unparameterized_query bit,
+    near_parallel bit,
+    plan_warnings bit,
+    plan_multiple_plans bit,
+    long_running bit,
+    downlevel_estimator bit,
+    implicit_conversions bit,
+    tempdb_spill bit,
+    busy_loops bit,
+    tvf_join bit,
+    tvf_estimate bit,
+    compile_timeout bit,
+    compile_memory_limit_exceeded bit,
+    warning_no_join_predicate bit,
+    QueryPlanCost float,
+    missing_index_count int,
+    unmatched_index_count int,
+    min_elapsed_time bigint,
+    max_elapsed_time bigint,
+    age_minutes money,
+    age_minutes_lifetime money,
+    is_trivial bit,
+    SetOptions VARCHAR(MAX),
+    Warnings VARCHAR(MAX)
+);
+GO
+
 ALTER PROCEDURE dbo.sp_BlitzCache
     @get_help BIT = 0,
-    @top INT = 50,
+    @top INT = 10,
     @sort_order VARCHAR(50) = 'CPU',
     @use_triggers_anyway BIT = NULL,
     @export_to_excel BIT = 0,
@@ -35,6 +138,7 @@ ALTER PROCEDURE dbo.sp_BlitzCache
     @query_filter VARCHAR(10) = 'ALL' ,
     @database_name NVARCHAR(128) = NULL ,
     @reanalyze BIT = 0 ,
+    @skip_analysis BIT = 0 ,
     @whole_cache BIT = 0 /* This will forcibly set @top to 2,147,483,647 */
 WITH RECOMPILE
 /******************************************
@@ -62,6 +166,18 @@ KNOWN ISSUES:
 - SQL Server 2008 and 2008R2 have a bug in trigger stats (see below).
 - @ignore_query_hashes and @only_query_hashes require a CSV list of hashes
   with no spaces between the hash values.
+
+v2.5.0 - 2015-10-23
+ - Now with errors when required values are set to NULL. Thanks to Raul
+   Gonzalez for pointing this out.
+ - changing default @top to 10
+ - Added a @skip_analysis to avoid the XML processing overhead
+ - Added QueryHash and QueryPlanHash to @export_to_excel and expert mode
+ - Adding sort order for recent compiles.
+ - Fixing potential INT overflow in totals temp table
+ - Fixing slow sort performance on xpm and friends
+ - Added compilation info (memory, CPU, time) and plan size to output
+ - Re-structured XML processing for more better performance
 
 v2.4.6 - 2015-06-18
  - temporary object cleanup will actually occur - thanks to Bob Klimes for
@@ -201,7 +317,7 @@ AS
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 /* VERSION! */
-RAISERROR (N'Executing sp_BlitzCache v2.4.6', 0, 1) WITH NOWAIT ;
+RAISERROR (N'Executing sp_BlitzCache v2.5.0', 0, 1) WITH NOWAIT ;
 
 DECLARE @nl nvarchar(2) = NCHAR(13) + NCHAR(10) ;
 
@@ -219,7 +335,7 @@ BEGIN
     UNION ALL
     SELECT N'@sort_order',
            N'VARCHAR(10)',
-           N'Data processing and display order. @sort_order will still be used, even when preparing output for a table or for excel. Possible values are: "CPU", "Reads", "Writes", "Duration", "Executions". Additionally, the word "Average" or "Avg" can be used to sort on averages rather than total. "Executions per minute" and "Executions / minute" can be used to sort by execution per minute. For the truly lazy, "xpm" can also be used.'
+           N'Data processing and display order. @sort_order will still be used, even when preparing output for a table or for excel. Possible values are: "CPU", "Reads", "Writes", "Duration", "Executions", "Recent Compilations". Additionally, the word "Average" or "Avg" can be used to sort on averages rather than total. "Executions per minute" and "Executions / minute" can be used to sort by execution per minute. For the truly lazy, "xpm" can also be used.'
 
     UNION ALL
     SELECT N'@use_triggers_anyway',
@@ -521,6 +637,16 @@ BEGIN
     RETURN
 END
 
+/* validate user inputs */
+IF @top IS NULL 
+    OR @sort_order IS NULL 
+    OR @query_filter IS NULL 
+    OR @reanalyze IS NULL
+BEGIN
+    RAISERROR(N'Several parameters (@top, @sort_order, @query_filter, @renalyze) are required. Do not set them to NULL. Please try again.', 16, 1) WITH NOWAIT;
+    RETURN;
+END
+
 IF OBJECT_ID('tempdb.dbo.##bou_BlitzCacheResults') IS NULL
 BEGIN
     CREATE TABLE ##bou_BlitzCacheResults (
@@ -531,7 +657,7 @@ BEGIN
         FindingsGroup VARCHAR(50),
         Finding VARCHAR(200),
         URL VARCHAR(200),
-        Details VARCHAR(4000) 
+        Details VARCHAR(4000)
     );
 END
 
@@ -590,6 +716,10 @@ BEGIN
         NumberOfDistinctPlans int,
         SerialDesiredMemory float,
         SerialRequiredMemory float,
+        CachedPlanSize float,
+        CompileTime float,
+        CompileCPU float ,
+        CompileMemory float ,
         min_worker_time bigint,
         max_worker_time bigint,
         is_forced_plan bit,
@@ -634,15 +764,20 @@ RAISERROR (N'Setting up temporary tables for sp_BlitzCache',0,1) WITH NOWAIT;
 IF @duration_filter IS NOT NULL
   SET @duration_filter_i = CAST((@duration_filter * 1000.0) AS INT)
 
+SET @database_name = LTRIM(RTRIM(@database_name)) ;
+
 SET @sort_order = LOWER(@sort_order);
 SET @sort_order = REPLACE(REPLACE(@sort_order, 'average', 'avg'), '.', '');
 SET @sort_order = REPLACE(@sort_order, 'executions per minute', 'avg executions');
 SET @sort_order = REPLACE(@sort_order, 'executions / minute', 'avg executions');
 SET @sort_order = REPLACE(@sort_order, 'xpm', 'avg executions');
+SET @sort_order = REPLACE(@sort_order, 'recent compilations', 'compiles');
+
 
 
 IF @sort_order NOT IN ('cpu', 'avg cpu', 'reads', 'avg reads', 'writes', 'avg writes',
-                       'duration', 'avg duration', 'executions', 'avg executions')
+                       'duration', 'avg duration', 'executions', 'avg executions',
+                       'compiles')
   SET @sort_order = 'cpu';
 
 SELECT @output_database_name = QUOTENAME(@output_database_name),
@@ -655,7 +790,10 @@ IF LEFT(@query_filter, 3) NOT IN ('all', 'sta', 'pro')
   SET @query_filter = 'all';
 
 IF @reanalyze = 1 AND OBJECT_ID('tempdb..##bou_BlitzCacheResults') IS NULL
-    SET @reanalyze = 0;
+  SET @reanalyze = 0;
+
+if @skip_analysis = 1
+    SET @hide_summary = 1;
 
 IF @reanalyze = 1 
     GOTO Results
@@ -854,7 +992,7 @@ DECLARE @sql nvarchar(MAX) = N'',
         @insert_list nvarchar(MAX) = N'',
         @plans_triggers_select_list nvarchar(MAX) = N'',
         @body nvarchar(MAX) = N'',
-        @body_where nvarchar(MAX) = N'',
+        @body_where nvarchar(MAX) = N'WHERE 1 = 1 ' + @nl,
         @body_order nvarchar(MAX) = N'ORDER BY #sortable# DESC OPTION (RECOMPILE) ',
         
         @q nvarchar(1) = N'''',
@@ -888,50 +1026,105 @@ INSERT INTO ##bou_BlitzCacheProcs (SPID, QueryType, DatabaseName, AverageCPU, To
                     min_worker_time, max_worker_time, is_parallel, min_elapsed_time, max_elapsed_time, age_minutes, age_minutes_lifetime) ' ;
 
 SET @body += N'
-FROM   (SELECT *,
+FROM   (SELECT TOP (@top) *,
                CAST((CASE WHEN DATEDIFF(mi, cached_time, GETDATE()) > 0 AND execution_count > 1
                           THEN DATEDIFF(mi, cached_time, GETDATE()) 
                           ELSE NULL END) as MONEY) as age_minutes,
                CAST((CASE WHEN DATEDIFF(mi, cached_time, last_execution_time) > 0 AND execution_count > 1
                           THEN DATEDIFF(mi, cached_time, last_execution_time) 
                           ELSE Null END) as MONEY) as age_minutes_lifetime
-        FROM   sys.#view# x ' + @nl ;
+        FROM   sys.#view# x
+               CROSS APPLY sys.dm_exec_plan_attributes(x.plan_handle) AS xpa ' + @nl ;
+
+/* filtering for query hashes */
+IF (SELECT COUNT(*) FROM #ignore_query_hashes) > 0
+   AND (SELECT COUNT(*) FROM #only_query_hashes) = 0
+BEGIN
+    SET @body += N'               LEFT JOIN #ignore_query_hashes iqh ON iqh.query_hash = qs.query_hash ' + @nl ;
+END
+
+IF (SELECT COUNT(*) FROM #ignore_query_hashes) > 0
+   AND (SELECT COUNT(*) FROM #only_query_hashes) = 0
+BEGIN
+    SET @body += N'                         AND iqh.query_hash IS NULL ' + @nl ;
+END
+/* end filtering for query hashes */
+
+
+
+SET @body += N'        WHERE  xpa.attribute = ' + QUOTENAME('dbid', @q) +  @nl ;
+
+IF @ignore_system_db = 1
+    SET @body += N'               AND COALESCE(DB_NAME(CAST(xpa.value AS INT)), '''') NOT IN (''master'', ''model'', ''msdb'', ''tempdb'', ''32767'') ' + @nl ;
+
+IF @database_name IS NOT NULL OR @database_name <> ''
+    SET @body += N'               AND CAST(xpa.value AS INT) = DB_ID('
+                 + QUOTENAME(@database_name, N'''')
+                 + N') ' + @nl;
 
 IF (SELECT COUNT(*) FROM #only_sql_handles) > 0
 BEGIN
-    SET @body += N'        WHERE  EXISTS(SELECT 1/0 FROM #only_sql_handles q WHERE q.sql_handle = x.sql_handle) ' + @nl ;
+    SET @body += N'               AND EXISTS(SELECT 1/0 FROM #only_sql_handles q WHERE q.sql_handle = x.sql_handle) ' + @nl ;
 END      
 
 IF (SELECT COUNT(*) FROM #only_query_hashes) > 0
    AND (SELECT COUNT(*) FROM #ignore_query_hashes) = 0
    AND (SELECT COUNT(*) FROM #only_sql_handles) = 0
 BEGIN
-    SET @body += N'        WHERE  EXISTS(SELECT 1/0 FROM #only_query_hashes q WHERE q.query_hash = x.query_hash) ' + @nl ;
+    SET @body += N'               AND EXISTS(SELECT 1/0 FROM #only_query_hashes q WHERE q.query_hash = x.query_hash) ' + @nl ;
 END
+
+IF @duration_filter IS NOT NULL
+    SET @body += N'       AND (total_elapsed_time / 1000.0) / execution_count > @min_duration ' + @nl ;
+
+
+
+/* Apply the sort order here to only grab relevant plans.
+   This should make it faster to process since we'll be pulling back fewer
+   plans for processing.
+ */
+SELECT @body += '        ORDER BY ' +
+                CASE @sort_order WHEN 'cpu' THEN 'total_worker_time'
+                                 WHEN 'reads' THEN 'total_logical_reads'
+                                 WHEN 'writes' THEN 'total_logical_writes'
+                                 WHEN 'duration' THEN 'total_elapsed_time'
+                                 WHEN 'executions' THEN 'execution_count'
+                                 WHEN 'compiles' THEN 'cached_time'
+                                 /* And now the averages */
+                                 WHEN 'avg cpu' THEN 'total_worker_time / execution_count'
+                                 WHEN 'avg reads' THEN 'total_logical_reads / execution_count'
+                                 WHEN 'avg writes' THEN 'total_logical_writes / execution_count'
+                                 WHEN 'avg duration' THEN 'total_elapsed_time / execution_count'
+                                 WHEN 'avg executions' THEN 'CASE WHEN execution_count = 0 THEN 0
+            WHEN COALESCE(CAST((CASE WHEN DATEDIFF(mi, cached_time, GETDATE()) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, GETDATE())
+                          ELSE NULL END) as MONEY), CAST((CASE WHEN DATEDIFF(mi, cached_time, last_execution_time) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, last_execution_time)
+                          ELSE Null END) as MONEY), 0) = 0 THEN 0
+            ELSE CAST((1.00 * execution_count / COALESCE(CAST((CASE WHEN DATEDIFF(mi, cached_time, GETDATE()) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, GETDATE())
+                          ELSE NULL END) as MONEY), CAST((CASE WHEN DATEDIFF(mi, cached_time, last_execution_time) > 0 AND execution_count > 1
+                          THEN DATEDIFF(mi, cached_time, last_execution_time)
+                          ELSE Null END) as MONEY))) AS money)
+            END '
+                END + ' DESC ' + @nl ;
+
 
                           
 SET @body += N') AS qs
        CROSS JOIN(SELECT SUM(execution_count) AS t_TotalExecs,
-                         SUM(total_elapsed_time) / 1000.0 AS t_TotalElapsed,
-                         SUM(total_worker_time) / 1000.0 AS t_TotalWorker,
-                         SUM(total_logical_reads) AS t_TotalReads,
-                         SUM(total_logical_writes) AS t_TotalWrites
+                         SUM(CAST(total_elapsed_time AS BIGINT) / 1000.0) AS t_TotalElapsed,
+                         SUM(CAST(total_worker_time AS BIGINT) / 1000.0) AS t_TotalWorker,
+                         SUM(CAST(total_logical_reads AS BIGINT)) AS t_TotalReads,
+                         SUM(CAST(total_logical_writes AS BIGINT)) AS t_TotalWrites
                   FROM   sys.#view#) AS t
-       CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
+        CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
        CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
        CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp ' + @nl ;
 
-SET @body_where = N'WHERE  pa.attribute = ' + QUOTENAME('dbid', @q) + @nl ;
+SET @body_where += N'       AND pa.attribute = ' + QUOTENAME('dbid', @q) + @nl ;
 
-SET @database_name = LTRIM(RTRIM(@database_name)) ;
 
-IF @database_name IS NOT NULL AND LEN(@database_name) > 0
-    SET @body_where += N'       AND CAST(pa.value AS INT) = DB_ID(' 
-                       + QUOTENAME(@database_name, '''')
-                       + ') ' + @nl ;
-
-IF @duration_filter IS NOT NULL
-    SET @body_where += N'       AND (total_elapsed_time / 1000.0) / execution_count > @min_duration ' + @nl ;
 
 SET @plans_triggers_select_list += N'
 SELECT TOP (@top)
@@ -1089,28 +1282,14 @@ BEGIN
     
     SET @sql += REPLACE(REPLACE(@body, '#view#', 'dm_exec_query_stats'), 'cached_time', 'creation_time') ;
     
-    IF (SELECT COUNT(*) FROM #ignore_query_hashes) > 0
-       AND (SELECT COUNT(*) FROM #only_query_hashes) = 0
-    BEGIN
-        SET @sql += REPLACE(@sql, ') AS qs', ') AS qs
-        LEFT JOIN #ignore_query_hashes iqh ON iqh.query_hash = qs.query_hash ' + @nl) ;
-    END
-    
-    
-    
-    
-    SET @sql += @body_where ;
-    
-    IF @ignore_system_db = 1
-        SET @sql += 'AND COALESCE(DB_NAME(CAST(pa.value AS INT)), '''') NOT IN (''master'', ''model'', ''msdb'', ''tempdb'', ''32767'') ' + @nl ;
-    
-    IF (SELECT COUNT(*) FROM #ignore_query_hashes) > 0
-       AND (SELECT COUNT(*) FROM #only_query_hashes) = 0
-    BEGIN
-        SET @sql += ' AND iqh.query_hash IS NULL ' + @nl ;
-    END
+    SET @sql += REPLACE(@body_where, 'cached_time', 'creation_time') ;
     
     SET @sql += @body_order + @nl + @nl + @nl;
+
+    IF @sort_order = 'compiles'
+    BEGIN
+        SET @sql = REPLACE(@sql, '#sortable#', 'creation_time');
+    END
 END
 
 
@@ -1165,7 +1344,6 @@ END
 
 
 
-
 DECLARE @sort NVARCHAR(MAX);
 
 SELECT @sort = CASE @sort_order WHEN 'cpu' THEN 'total_worker_time'
@@ -1173,6 +1351,7 @@ SELECT @sort = CASE @sort_order WHEN 'cpu' THEN 'total_worker_time'
                                 WHEN 'writes' THEN 'total_logical_writes'
                                 WHEN 'duration' THEN 'total_elapsed_time'
                                 WHEN 'executions' THEN 'execution_count'
+                                WHEN 'compiles' THEN 'cached_time'
                                 /* And now the averages */
                                 WHEN 'avg cpu' THEN 'total_worker_time / execution_count'
                                 WHEN 'avg reads' THEN 'total_logical_reads / execution_count'
@@ -1211,6 +1390,7 @@ SELECT @sort = CASE @sort_order WHEN 'cpu' THEN 'TotalCPU'
                                 WHEN 'writes' THEN 'TotalWrites'
                                 WHEN 'duration' THEN 'TotalDuration'
                                 WHEN 'executions' THEN 'ExecutionCount'
+                                WHEN 'compiles' THEN 'PlanCreationTime'
                                 WHEN 'avg cpu' THEN 'TotalCPU / ExecutionCount'
                                 WHEN 'avg reads' THEN 'TotalReads / ExecutionCount'
                                 WHEN 'avg writes' THEN 'TotalWrites / ExecutionCount'
@@ -1222,6 +1402,7 @@ SELECT @sort = CASE @sort_order WHEN 'cpu' THEN 'TotalCPU'
                END ;
 
 SELECT @sql = REPLACE(@sql, '#sortable#', @sort);
+
 
 
 IF @reanalyze = 0
@@ -1372,6 +1553,115 @@ OPTION (RECOMPILE) ;
 
 
 
+/* Testing using XML nodes to speed up processing */
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+SELECT  QueryHash ,
+        SqlHandle ,
+        q.n.query('.') AS statement
+INTO    #statements
+FROM    ##bou_BlitzCacheProcs p
+        CROSS APPLY p.QueryPlan.nodes('//p:StmtSimple') AS q(n) ;
+
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+SELECT  QueryHash ,
+        SqlHandle ,
+        q.n.query('.') AS query_plan
+INTO    #query_plan
+FROM    #statements p
+        CROSS APPLY p.statement.nodes('//p:QueryPlan') AS q(n) ;
+
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+SELECT  QueryHash ,
+        SqlHandle ,
+        q.n.query('.') AS relop
+INTO    #relop
+FROM    #query_plan p
+        CROSS APPLY p.query_plan.nodes('//p:RelOp') AS q(n) ;
+
+
+
+-- high level plan stuff
+UPDATE  ##bou_BlitzCacheProcs
+SET     NumberOfDistinctPlans = distinct_plan_count,
+        NumberOfPlans = number_of_plans ,
+        plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN 1 END
+FROM (
+        SELECT  COUNT(DISTINCT QueryHash) AS distinct_plan_count,
+                COUNT(QueryHash) AS number_of_plans,
+                QueryHash
+        FROM    ##bou_BlitzCacheProcs
+        GROUP BY QueryHash
+) AS x
+WHERE ##bou_BlitzCacheProcs.QueryHash = x.QueryHash
+OPTION (RECOMPILE) ;
+
+-- statement level checks
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+UPDATE ##bou_BlitzCacheProcs
+SET     QueryPlanCost = CASE WHEN QueryType LIKE '%Stored Procedure%' THEN
+                                statement.value('sum(/p:StmtSimple/@StatementSubTreeCost)', 'float')
+                             ELSE
+                                statement.value('sum(/p:StmtSimple[xs:hexBinary(substring(@QueryPlanHash, 3)) = xs:hexBinary(sql:column("QueryPlanHash"))]/@StatementSubTreeCost)', 'float')
+                        END ,
+        compile_timeout = CASE WHEN statement.exist('/p:StmtSimple/@StatementOptmEarlyAbortReason[.="TimeOut"]') = 1 THEN 1 END ,
+        compile_memory_limit_exceeded = CASE WHEN statement.exist('/p:StmtSimple/@StatementOptmEarlyAbortReason[.="MemoryLimitExceeded"]') = 1 THEN 1 END ,
+        unmatched_index_count = statement.value('count(//p:UnmatchedIndexes/Parameterization/Object)', 'int') ,
+        is_trivial = CASE WHEN statement.exist('/p:StmtSimple[@StatementOptmLevel[.="TRIVIAL"]]/p:QueryPlan/p:ParameterList') = 1 THEN 1 END ,
+        unparameterized_query = CASE WHEN statement.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/p:QueryPlan/p:ParameterList') = 1 AND
+                                          statement.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/p:QueryPlan/p:ParameterList/p:ColumnReference') = 0 THEN 1
+                                     WHEN statement.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/p:QueryPlan/p:ParameterList') = 0 AND
+                                          statement.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/*/p:RelOp/descendant::p:ScalarOperator/p:Identifier/p:ColumnReference[contains(@Column, "@")]') = 1 THEN 1
+                                END
+FROM    #statements s
+WHERE   s.QueryHash = ##bou_BlitzCacheProcs.QueryHash
+OPTION (RECOMPILE);
+
+-- query level checks
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+UPDATE  ##bou_BlitzCacheProcs
+SET     missing_index_count = query_plan.value('count(/p:QueryPlan/p:MissingIndexes/p:MissingIndexGroup)', 'int') ,
+        SerialDesiredMemory = query_plan.value('sum(/p:QueryPlan/p:MemoryGrantInfo/@SerialDesiredMemory)', 'float') ,
+        SerialRequiredMemory = query_plan.value('sum(/p:QueryPlan/p:MemoryGrantInfo/@SerialRequiredMemory)', 'float'),
+        CachedPlanSize = query_plan.value('sum(/p:QueryPlan/@CachedPlanSize)', 'float') ,
+        CompileTime = query_plan.value('sum(/p:QueryPlan/@CompileTime)', 'float') ,
+        CompileCPU = query_plan.value('sum(/p:QueryPlan/@CompileCPU)', 'float') ,
+        CompileMemory = query_plan.value('sum(/p:QueryPlan/@CompileMemory)', 'float') ,
+        implicit_conversions = CASE WHEN QueryPlan.exist('/p:QueryPlan/p:Warnings/p:PlanAffectingConvert/@Expression[contains(., "CONVERT_IMPLICIT")]') = 1 THEN 1 END ,
+        plan_warnings = CASE WHEN QueryPlan.value('count(/p:QueryPlan/p:Warnings)', 'int') > 0 THEN 1 END
+FROM    #query_plan qp
+WHERE   qp.QueryHash = ##bou_BlitzCacheProcs.QueryHash
+OPTION (RECOMPILE);
+
+-- operator level checks
+WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+UPDATE p
+SET    busy_loops = CASE WHEN (x.estimated_executions / 100.0) > x.estimated_rows THEN 1 END ,
+       tvf_join = CASE WHEN x.tvf_join = 1 THEN 1 END ,
+       warning_no_join_predicate = CASE WHEN x.no_join_warning = 1 THEN 1 END
+FROM   ##bou_BlitzCacheProcs p
+       JOIN (
+            SELECT qs.SqlHandle,
+                   relop.value('sum(/p:RelOp/@EstimateRows)', 'float') AS estimated_rows ,
+                   relop.value('sum(/p:RelOp/@EstimateRewinds)', 'float') + relop.value('sum(/p:RelOp/@EstimateRebinds)', 'float') + 1.0 AS estimated_executions ,
+                   relop.exist('/p:RelOp[contains(@LogicalOp, "Join")]/*/p:RelOp[(@LogicalOp[.="Table-valued function"])]') AS tvf_join,
+                   relop.exist('/p:RelOp/p:Warnings[(@NoJoinPredicate[.="1"])]') AS no_join_warning
+            FROM   #relop qs
+       ) AS x ON p.SqlHandle = x.SqlHandle
+OPTION (RECOMPILE);
+
+IF @v >= 12
+BEGIN
+    RAISERROR('Checking for downlevel cardinality estimators being used on SQL Server 2014.', 0, 1) WITH NOWAIT;
+
+    WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
+    UPDATE  p
+    SET     downlevel_estimator = CASE WHEN statement.value('min(//p:StmtSimple/@CardinalityEstimationModelVersion)', 'int') < (@v * 10) THEN 1 END
+    FROM    ##bou_BlitzCacheProcs p
+            JOIN #statements s ON p.QueryHash = s.QueryHash ;
+END ;
+
+/* END Testing using XML nodes to speed up processing */
+
 WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
 UPDATE ##bou_BlitzCacheProcs
 SET NumberOfDistinctPlans = distinct_plan_count,
@@ -1386,7 +1676,11 @@ SET NumberOfDistinctPlans = distinct_plan_count,
     plan_multiple_plans = CASE WHEN distinct_plan_count < number_of_plans THEN 1 END ,
     is_trivial = CASE WHEN QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="TRIVIAL"]]/p:QueryPlan/p:ParameterList') = 1 THEN 1 END ,
     SerialDesiredMemory = QueryPlan.value('sum(//p:MemoryGrantInfo/@SerialDesiredMemory)', 'float') ,
-    SerialRequiredMemory = QueryPlan.value('sum(//p:MemoryGrantInfo/@SerialRequiredMemory)', 'float')
+    SerialRequiredMemory = QueryPlan.value('sum(//p:MemoryGrantInfo/@SerialRequiredMemory)', 'float'),
+    CachedPlanSize = QueryPlan.value('sum(//p:QueryPlan/@CachedPlanSize)', 'float') ,
+    CompileTime = QueryPlan.value('sum(//p:QueryPlan/@CompileTime)', 'float') ,
+    CompileCPU = QueryPlan.value('sum(//p:QueryPlan/@CompileCPU)', 'float') ,
+    CompileMemory = QueryPlan.value('sum(//p:QueryPlan/@CompileMemory)', 'float')
 FROM (
 SELECT COUNT(DISTINCT QueryHash) AS distinct_plan_count,
        COUNT(QueryHash) AS number_of_plans,
@@ -1396,6 +1690,22 @@ GROUP BY QueryHash
 ) AS x
 WHERE ##bou_BlitzCacheProcs.QueryHash = x.QueryHash
 OPTION (RECOMPILE) ;
+
+
+/* Update to grab stored procedure name for individual statements */
+UPDATE  p
+SET     QueryType = QueryType + ' (parent ' +
+                    + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id, s.database_id))
+                    + '.'
+                    + QUOTENAME(OBJECT_NAME(s.object_id, s.database_id)) + ')'
+FROM    ##bou_BlitzCacheProcs p
+        JOIN sys.dm_exec_procedure_stats s ON p.SqlHandle = s.sql_handle
+WHERE   QueryType = 'Statement'
+
+
+
+IF @skip_analysis = 1
+    GOTO Results ;
 
 
 
@@ -1471,18 +1781,6 @@ OPTION (RECOMPILE);
 
 
 
-/* Update to grab stored procedure name for individual statements */
-UPDATE  p
-SET     QueryType = QueryType + ' (parent ' + 
-                    + QUOTENAME(OBJECT_SCHEMA_NAME(s.object_id, s.database_id))
-                    + '.'
-                    + QUOTENAME(OBJECT_NAME(s.object_id, s.database_id)) + ')'
-FROM    ##bou_BlitzCacheProcs p
-        JOIN sys.dm_exec_procedure_stats s ON p.SqlHandle = s.sql_handle
-WHERE   QueryType = 'Statement'
-
-
-
 /* Update to populate checks columns */
 RAISERROR('Checking for query level SQL Server issues.', 0, 1) WITH NOWAIT;
 
@@ -1498,55 +1796,9 @@ SET    frequent_execution = CASE WHEN ExecutionsPerMinute > @execution_threshold
                                  WHEN AverageReads > @parameter_sniffing_io_threshold
                                       AND MaxReturnedRows > ((1.0 + (@parameter_sniffing_warning_pct / 100.0)) * AverageReturnedRows) THEN 1 END ,
        near_parallel = CASE WHEN QueryPlanCost BETWEEN @ctp * (1 - (@ctp_threshold_pct / 100.0)) AND @ctp THEN 1 END,
-       plan_warnings = CASE WHEN QueryPlan.value('count(//p:Warnings)', 'int') > 0 THEN 1 END,
        long_running = CASE WHEN AverageDuration > @long_running_query_warning_seconds THEN 1
                            WHEN max_worker_time > @long_running_query_warning_seconds THEN 1
-                           WHEN max_elapsed_time > @long_running_query_warning_seconds THEN 1 END ,
-       implicit_conversions = CASE WHEN QueryPlan.exist('
-                                        //p:PlanAffectingConvert/@Expression
-                                        [contains(., "CONVERT_IMPLICIT")]') = 1 THEN 1
-                                   END ,
-       tempdb_spill = CASE WHEN QueryPlan.value('max(//p:SpillToTempDb/@SpillLevel)', 'int') > 0 THEN 1 END ,
-       unparameterized_query = CASE WHEN QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/p:QueryPlan/p:ParameterList') = 1 AND
-                                         QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/p:QueryPlan/p:ParameterList/p:ColumnReference') = 0 THEN 1
-                                    WHEN QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/p:QueryPlan/p:ParameterList') = 0 AND
-                                         QueryPlan.exist('//p:StmtSimple[@StatementOptmLevel[.="FULL"]]/*/p:RelOp/descendant::p:ScalarOperator/p:Identifier/p:ColumnReference[contains(@Column, "@")]')
-                                         = 1 THEN 1 END ;
-
-
-
-/* Checks that require examining individual plan nodes, as opposed to
-   the entire plan
- */
-RAISERROR('Scanning individual plan nodes for query issues.', 0, 1) WITH NOWAIT;
-
-WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-UPDATE p
-SET    busy_loops = CASE WHEN (x.estimated_executions / 100.0) > x.estimated_rows THEN 1 END ,
-       tvf_join = CASE WHEN x.tvf_join = 1 THEN 1 END ,
-       warning_no_join_predicate = CASE WHEN x.no_join_warning = 1 THEN 1 END
-FROM   ##bou_BlitzCacheProcs p
-       JOIN (
-            SELECT qs.SqlHandle,
-                   n.value('@EstimateRows', 'float') AS estimated_rows ,
-                   n.value('@EstimateRewinds', 'float') + n.value('@EstimateRebinds', 'float') + 1.0 AS estimated_executions ,
-                   n.query('.').exist('/p:RelOp[contains(@LogicalOp, "Join")]/*/p:RelOp[(@LogicalOp[.="Table-valued function"])]') AS tvf_join,
-                   n.query('.').exist('//p:RelOp/p:Warnings[(@NoJoinPredicate[.="1"])]') AS no_join_warning
-            FROM   ##bou_BlitzCacheProcs qs
-                   OUTER APPLY qs.QueryPlan.nodes('//p:RelOp') AS q(n)
-       ) AS x ON p.SqlHandle = x.SqlHandle ;
-
-
-
-/* Check for timeout plan termination */
-RAISERROR('Checking for plan compilation timeouts.', 0, 1) WITH NOWAIT;
-
-WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-UPDATE p
-SET    compile_timeout = CASE WHEN n.query('.').exist('/p:StmtSimple/@StatementOptmEarlyAbortReason[.="TimeOut"]') = 1 THEN 1 END ,
-       compile_memory_limit_exceeded = CASE WHEN n.query('.').exist('/p:StmtSimple/@StatementOptmEarlyAbortReason[.="MemoryLimitExceeded"]') = 1 THEN 1 END
-FROM   ##bou_BlitzCacheProcs p
-       CROSS APPLY p.QueryPlan.nodes('//p:StmtSimple') AS q(n) ;
+                           WHEN max_elapsed_time > @long_running_query_warning_seconds THEN 1 END ;
 
 
 
@@ -1583,15 +1835,7 @@ WHERE  pa.attribute LIKE '%cursor%' ;
 
 
 
-/* Downlevel cardinality estimator */
-IF @v >= 12
-BEGIN
-    RAISERROR('Checking for downlevel cardinality estimators being used on SQL Server 2014.', 0, 1) WITH NOWAIT;
 
-    WITH XMLNAMESPACES('http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS p)
-    UPDATE ##bou_BlitzCacheProcs
-    SET    downlevel_estimator = CASE WHEN QueryPlan.value('min(//p:StmtSimple/@CardinalityEstimationModelVersion)', 'int') < (@v * 10) THEN 1 END ;
-END
 
 
 
@@ -1732,6 +1976,7 @@ BEGIN
                                                     WHEN 'writes' THEN ' TotalWrites '
                                                     WHEN 'duration' THEN ' TotalDuration '
                                                     WHEN 'executions' THEN ' ExecutionCount '
+                                                    WHEN 'compiles' THEN ' PlanCreationTime '
                                                     WHEN 'avg cpu' THEN 'AverageCPU'
                                                     WHEN 'avg reads' THEN 'AverageReads'
                                                     WHEN 'avg writes' THEN 'AverageWrites'
@@ -1792,6 +2037,8 @@ BEGIN
             LastExecutionTime AS [Last Execution],
             StatementStartOffset,
             StatementEndOffset,
+            QueryHash,
+            QueryPlanHash,
             COALESCE(SetOptions, '''') AS [SET Options]
     FROM    ##bou_BlitzCacheProcs
     WHERE   1 = 1 ' + @nl
@@ -1801,6 +2048,7 @@ BEGIN
                               WHEN 'writes' THEN ' TotalWrites '
                               WHEN 'duration' THEN ' TotalDuration '
                               WHEN 'executions' THEN ' ExecutionCount '
+                              WHEN 'compiles' THEN ' PlanCreationTime '
                               WHEN 'avg cpu' THEN 'AverageCPU'
                               WHEN 'avg reads' THEN 'AverageReads'
                               WHEN 'avg writes' THEN 'AverageWrites'
@@ -2243,10 +2491,15 @@ BEGIN
         LastExecutionTime AS [Last Execution],
         QueryPlanCost AS [Query Plan Cost],
         QueryPlan AS [Query Plan],
+        CachedPlanSize AS [Cached Plan Size (KB)],
+        CompileTime AS [Compile Time (ms)],
+        CompileCPU AS [Compile CPU (ms)],
+        CompileMemory AS [Compile memory (KB)],
         COALESCE(SetOptions, '''') AS [SET Options],
         PlanHandle AS [Plan Handle],
         SqlHandle AS [SQL Handle],
         QueryHash AS [Query Hash],
+        QueryPlanHash AS [Query Plan Hash],
         StatementStartOffset,
         StatementEndOffset ';
 END
@@ -2263,6 +2516,7 @@ SELECT @sql += N' ORDER BY ' + CASE @sort_order WHEN 'cpu' THEN ' TotalCPU '
                                                 WHEN 'writes' THEN ' TotalWrites '
                                                 WHEN 'duration' THEN ' TotalDuration '
                                                 WHEN 'executions' THEN ' ExecutionCount '
+                                                WHEN 'compiles' THEN ' PlanCreationTime '
                                                 WHEN 'avg cpu' THEN 'AverageCPU'
                                                 WHEN 'avg reads' THEN 'AverageReads'
                                                 WHEN 'avg writes' THEN 'AverageWrites'

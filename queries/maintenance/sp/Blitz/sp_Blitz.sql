@@ -1,8 +1,8 @@
 USE [master];
 GO
 
-IF EXISTS(SELECT * FROM sys.databases WHERE compatibility_level < 90 AND name = 'master')
-	RAISERROR ('sp_Blitz cannot be installed when master database is still in 2000 compatibility mode. For information: http://BrentOzar.com/blitz/', 20,1) WITH LOG, NOWAIT;
+IF EXISTS(SELECT * FROM sys.databases WHERE compatibility_level < 90)
+	RAISERROR ('sp_Blitz cannot be installed when databases are still in 2000 compatibility mode. For information: http://BrentOzar.com/blitz/', 20,1) WITH LOG, NOWAIT;
 GO
 
 IF OBJECT_ID('dbo.sp_Blitz') IS NULL
