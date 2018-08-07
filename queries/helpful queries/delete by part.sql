@@ -19,8 +19,4 @@ SET ROWCOUNT 0
 ;WITH C AS (
 	SELECT TOP (1000) * FROM Sales.MyOrderDetails ORDER BY ID
 	)
-<<<<<<< HEAD
 DELETE FROM C
-=======
-DELETE FROM C
->>>>>>> update script for part delete
