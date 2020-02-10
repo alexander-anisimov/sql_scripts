@@ -1,13 +1,3 @@
-/* ** Agent Job List ******************************************************** **
-** Description: Create a list of agent jobs and their schedules.
-** Author: Michael McCormick
-** Acknowledgments:
-**   Ken Simmons - for revealing the existence of the sp_get_schedule_description
-**     procedure and revealing the underlying code.
-**   Michelle Ufford - for the idea of using the code as a CTE for the job query
-**     and providing the basic structure for the CTE query.
-** 
-** ************************************************************************** */
 USE [msdb]
 GO
 
